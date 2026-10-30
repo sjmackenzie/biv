@@ -30,6 +30,17 @@ Models are looked up in the Hugging Face cache (`$HF_HUB_CACHE`, `$HF_HOME/hub`,
 same `hf.co/<owner>/<repo>:<quant>` names. Split GGUFs (`-00001-of-0000N`) are loaded
 as one model.
 
+The `hf` command (`brew install hf`, or `pip install -U huggingface_hub`) also downloads to that cache:
+
+```sh
+hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-Q4_1.gguf   # the default, 17.5 GB
+hf download unsloth/Qwen3.8-27B-GGUF --include 'BF16/*'      # :BF16, two shards, 55 GB
+hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-Q8_0.gguf   # :Q8_0, 29 GB
+```
+
+Other quants are files of the same repo (`hf download unsloth/Qwen3.8-27B-GGUF
+--dry-run` lists them); `-m hf.co/unsloth/Qwen3.8-27B-GGUF:<quant>` picks one.
+
 Decoding is speculative by default: the model's MTP head drafts the next token,
 and the trunk checks it in the same pass as the current one (`--draft <n>` sets
 how many tokens are drafted, `0` turns it off). The output is the same as
