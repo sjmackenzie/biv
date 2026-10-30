@@ -1,0 +1,21 @@
+[workspace]
+members = [".", "engine"]
+
+[package]
+name = "biv-cli"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "biv"
+path = "src/main.rs"
+
+[dependencies]
+biv = { path = "engine" }
+ctrlc = "3.5.2"
+memmap2 = "0.9.12"
+rayon = "1.12.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+biv = { path = "engine", features = ["metal"] }

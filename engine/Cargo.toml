@@ -1,0 +1,30 @@
+[package]
+name = "biv"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Small inference engine: GGUF parsing, quantized kernels, model graph, tokenizer, sampling, chat"
+
+[features]
+default = ["std", "rayon"]
+# std's float functions; without it the crate is no_std + alloc (libm)
+std = []
+# multithreaded CPU compute
+rayon = ["std", "dep:rayon"]
+# Metal GPU backend (macOS)
+metal = ["std", "dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]
+
+[dependencies]
+hashbrown = "0.16"
+libm = "0.2.16"
+unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
+rayon = { version = "1.12.0", optional = true }
+
+[dev-dependencies]
+# only for reference for the hand-written pre-tokenizer
+fancy-regex = "0.20.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.5", optional = true }
+objc2-foundation = { version = "0.3.2", optional = true }
+objc2-metal = { version = "0.3.2", optional = true }
