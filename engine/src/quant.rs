@@ -441,8 +441,13 @@ pub fn dot_x4(ty: GgmlType, w: &[u8], xf: [&[f32]; 4], xq: Option<[Q8Slice<'_>; 
         return unsafe { neon::dot_q4_1_x4(w, xq.expect("quantized activations required")) };
     }
     #[cfg(target_arch = "x86_64")]
-    if ty == GgmlType::Q4_1 && x86::has_avx2() {
-        return unsafe { x86::dot_q4_1_x4(w, xq.expect("quantized activations required")) };
+    if ty == GgmlType::Q4_1 {
+        let xq = || xq.expect("quantized activations required");
+        match x86::level() {
+            x86::Level::AvxVnni => return unsafe { x86::vnni::dot_q4_1_x4(w, xq()) },
+            x86::Level::Avx2 => return unsafe { x86::avx2::dot_q4_1_x4(w, xq()) },
+            x86::Level::Scalar => {}
+        }
     }
     core::array::from_fn(|t| dot(ty, w, xf[t], xq.map(|q| q[t])))
 }
@@ -516,8 +521,8 @@ fn dot_bf16(w: &[u8], x: &[f32]) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// quantized kernels: NEON (dotprod) on aarch64, AVX2 on x86-64 when the CPU
-// has it, the scalar reference otherwise
+// quantized kernels: NEON (dotprod) on aarch64, AVX-VNNI or AVX2 on x86-64
+// when the CPU has it, the scalar reference otherwise
 
 macro_rules! quant_dots {
     ($($name:ident),*) => {$(
@@ -526,8 +531,10 @@ macro_rules! quant_dots {
             #[cfg(target_arch = "aarch64")]
             return unsafe { neon::$name(w, x) };
             #[cfg(target_arch = "x86_64")]
-            if x86::has_avx2() {
-                return unsafe { x86::$name(w, x) };
+            match x86::level() {
+                x86::Level::AvxVnni => return unsafe { x86::vnni::$name(w, x) },
+                x86::Level::Avx2 => return unsafe { x86::avx2::$name(w, x) },
+                x86::Level::Scalar => {}
             }
             scalar::$name(w, x)
         }
@@ -536,14 +543,16 @@ macro_rules! quant_dots {
 
 quant_dots!(dot_q4_0, dot_q4_1, dot_q8_0, dot_q4k, dot_q5k, dot_q6k);
 
-/// The dot kernels this machine runs: `neon` (with dotprod) on aarch64, `avx2`
-/// on x86-64 CPUs that have it, `scalar` otherwise
+/// The dot kernels this machine runs: `neon` (with dotprod) on aarch64,
+/// `avxvnni` or `avx2` on x86-64 CPUs that have them, `scalar` otherwise
 pub fn kernels() -> &'static str {
     #[cfg(target_arch = "aarch64")]
     return "neon";
     #[cfg(target_arch = "x86_64")]
-    if x86::has_avx2() {
-        return "avx2";
+    match x86::level() {
+        x86::Level::AvxVnni => return "avxvnni",
+        x86::Level::Avx2 => return "avx2",
+        x86::Level::Scalar => {}
     }
     #[allow(unreachable_code)]
     "scalar"
@@ -1022,47 +1031,73 @@ mod neon {
     }
 }
 
-/// AVX2 + FMA + F16C kernels (Haswell / Zen and later), picked at run time so
-/// that a baseline x86-64 build still runs everywhere. The int8 products use
-/// `maddubs` (unsigned x signed bytes); signed weights go through the
-/// `sign` trick. No pair sum can saturate its i16: weights are at most 128 in
-/// magnitude and activations at most 127.
+/// x86-64 kernels, picked at run time so that a baseline build still runs
+/// everywhere: AVX2 + FMA + F16C (Haswell / Zen and later), and the same int8
+/// kernels with AVX-VNNI (Alder Lake / Zen 5 and later). AVX2 multiplies int8
+/// with `maddubs` (unsigned x signed bytes, pairs summed into i16) then `madd`
+/// into i32; VNNI's `vpdpbusd` does both in one instruction. Signed weights go
+/// through the `sign` trick. No pair sum can saturate its i16: weights are at
+/// most 128 in magnitude and activations at most 127, so both give the same
+/// i32 lanes, which go through the same float operations: the VNNI kernels'
+/// results are bit for bit those of the AVX2 ones.
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use super::{Q8Slice, scale_min_k4};
     use core::arch::x86_64::*;
 
-    /// Whether the kernels can run: the cpuid result is cached, so this is a
-    /// load, and a constant when the build targets these features
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum Level {
+        Scalar,
+        Avx2,
+        AvxVnni,
+    }
+
+    /// The best kernels the CPU can run: the cpuid result is cached, so this
+    /// is a load, and a constant when the build targets all the features
     #[inline]
-    pub fn has_avx2() -> bool {
+    pub fn level() -> Level {
         use core::sync::atomic::{AtomicU8, Ordering};
         const UNKNOWN: u8 = 0;
-        const NO: u8 = 1;
-        const YES: u8 = 2;
         static DETECTED: AtomicU8 = AtomicU8::new(UNKNOWN);
 
         if cfg!(all(
             target_feature = "avx2",
             target_feature = "fma",
+            target_feature = "f16c",
+            target_feature = "avxvnni"
+        )) {
+            return Level::AvxVnni;
+        }
+        let level = match DETECTED.load(Ordering::Relaxed) {
+            UNKNOWN => {
+                let level = detect();
+                DETECTED.store(level as u8 + 1, Ordering::Relaxed);
+                level
+            }
+            1 => Level::Scalar,
+            2 => Level::Avx2,
+            _ => Level::AvxVnni,
+        };
+        if cfg!(all(
+            target_feature = "avx2",
+            target_feature = "fma",
             target_feature = "f16c"
         )) {
-            return true;
-        }
-        match DETECTED.load(Ordering::Relaxed) {
-            UNKNOWN => {
-                let yes = detect();
-                DETECTED.store(if yes { YES } else { NO }, Ordering::Relaxed);
-                yes
-            }
-            v => v == YES,
+            level.max(Level::Avx2)
+        } else {
+            level
         }
     }
 
+    #[inline]
+    pub fn has_avx2() -> bool {
+        level() >= Level::Avx2
+    }
+
     /// AVX2, FMA and F16C from cpuid, and the OS saving the AVX registers
-    /// on context switches (XCR0), without which AVX faults
+    /// on context switches (XCR0), without which AVX faults; then AVX-VNNI
     #[cold]
-    fn detect() -> bool {
+    fn detect() -> Level {
         let leaf1 = __cpuid(1);
         let bit = |r: u32, b: u32| r & (1 << b) != 0;
         let (fma, osxsave, avx, f16c) = (
@@ -1072,12 +1107,19 @@ mod x86 {
             bit(leaf1.ecx, 29),
         );
         if !(fma && osxsave && avx && f16c) || __cpuid(0).eax < 7 {
-            return false;
+            return Level::Scalar;
         }
         // SAFETY: OSXSAVE is set, so xgetbv is available
         let xcr0 = unsafe { _xgetbv(0) };
         let ymm_saved = xcr0 & 0b110 == 0b110; // SSE and AVX state
-        ymm_saved && bit(__cpuid_count(7, 0).ebx, 5)
+        if !(ymm_saved && bit(__cpuid_count(7, 0).ebx, 5)) {
+            return Level::Scalar;
+        }
+        if bit(__cpuid_count(7, 1).eax, 4) {
+            Level::AvxVnni
+        } else {
+            Level::Avx2
+        }
     }
 
     #[inline]
@@ -1108,20 +1150,6 @@ mod x86 {
         let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
         let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
         _mm_cvtss_f32(_mm_add_ss(s, _mm_movehdup_ps(s)))
-    }
-
-    /// Products of unsigned bytes `u` and signed bytes `s`, summed into 8 i32
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    fn dot_u8_i8(u: __m256i, s: __m256i) -> __m256i {
-        _mm256_madd_epi16(_mm256_maddubs_epi16(u, s), _mm256_set1_epi16(1))
-    }
-
-    /// Products of signed bytes `a` and `s`, summed into 8 i32
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    fn dot_i8_i8(a: __m256i, s: __m256i) -> __m256i {
-        dot_u8_i8(_mm256_sign_epi8(a, a), _mm256_sign_epi8(s, a))
     }
 
     /// `acc += p * d`, `p` converted from i32
@@ -1249,231 +1277,271 @@ mod x86 {
         }
     }
 
-    #[target_feature(enable = "avx2,fma,f16c")]
-    pub unsafe fn dot_q4_0(w: &[u8], x: Q8Slice<'_>) -> f32 {
-        unsafe {
-            let nb = x.d.len();
-            assert!(w.len() >= 18 * nb && x.qs.len() >= 32 * nb);
-            let (wp, xq) = (w.as_ptr(), x.qs.as_ptr());
-            let s8 = _mm256_set1_epi8(8);
-            let mut acc = [_mm256_setzero_ps(); 2];
-            for i in 0..nb {
-                let b = wp.add(18 * i);
-                let q = _mm256_sub_epi8(q4_nibbles(b.add(2)), s8);
-                acc[i & 1] = fma_i32(
-                    acc[i & 1],
-                    dot_i8_i8(q, loadx(xq.add(32 * i))),
-                    f16(b) * x.d[i],
-                );
-            }
-            hsum(_mm256_add_ps(acc[0], acc[1]))
-        }
-    }
+    /// The int8 dot kernels, compiled for the target features `$feat`, with
+    /// `$dot(u, s)` summing the products of unsigned bytes `u` and signed bytes
+    /// `s` into 8 i32 (each of 4 consecutive bytes)
+    macro_rules! int8_kernels {
+        ($m:ident, $feat:literal, |$u:ident, $s:ident| $dot:expr) => {
+            pub mod $m {
+                use super::*;
 
-    #[target_feature(enable = "avx2,fma,f16c")]
-    pub unsafe fn dot_q4_1(w: &[u8], x: Q8Slice<'_>) -> f32 {
-        unsafe {
-            let nb = x.d.len();
-            assert!(w.len() >= 20 * nb && x.qs.len() >= 32 * nb && x.s.len() >= nb);
-            let (wp, xq) = (w.as_ptr(), x.qs.as_ptr());
-            let mut acc = [_mm256_setzero_ps(); 2];
-            let mut summs = 0.0f32;
-            for i in 0..nb {
-                let b = wp.add(20 * i);
-                let p = dot_u8_i8(q4_nibbles(b.add(4)), loadx(xq.add(32 * i)));
-                acc[i & 1] = fma_i32(acc[i & 1], p, f16(b) * x.d[i]);
-                summs += f16(b.add(2)) * x.s[i];
-            }
-            hsum(_mm256_add_ps(acc[0], acc[1])) + summs
-        }
-    }
-
-    /// One q4_1 row against four activation rows: the block is unpacked once
-    #[target_feature(enable = "avx2,fma,f16c")]
-    pub unsafe fn dot_q4_1_x4(w: &[u8], x: [Q8Slice<'_>; 4]) -> [f32; 4] {
-        unsafe {
-            let nb = x[0].d.len();
-            assert!(w.len() >= 20 * nb);
-            assert!(
-                x.iter()
-                    .all(|x| x.qs.len() >= 32 * nb && x.d.len() >= nb && x.s.len() >= nb)
-            );
-            let wp = w.as_ptr();
-            let mut acc = [_mm256_setzero_ps(); 4];
-            let mut summs = [0.0f32; 4];
-            for i in 0..nb {
-                let b = wp.add(20 * i);
-                let q = q4_nibbles(b.add(4));
-                let (d, m) = (f16(b), f16(b.add(2)));
-                for t in 0..4 {
-                    let p = dot_u8_i8(q, loadx(x[t].qs.as_ptr().add(32 * i)));
-                    acc[t] = fma_i32(acc[t], p, d * *x[t].d.get_unchecked(i));
-                    summs[t] += m * *x[t].s.get_unchecked(i);
+                #[inline]
+                #[target_feature(enable = $feat)]
+                fn dot_u8_i8($u: __m256i, $s: __m256i) -> __m256i {
+                    $dot
                 }
-            }
-            core::array::from_fn(|t| hsum(acc[t]) + summs[t])
-        }
-    }
 
-    #[target_feature(enable = "avx2,fma,f16c")]
-    pub unsafe fn dot_q8_0(w: &[u8], x: Q8Slice<'_>) -> f32 {
-        unsafe {
-            let nb = x.d.len();
-            assert!(w.len() >= 34 * nb && x.qs.len() >= 32 * nb);
-            let (wp, xq) = (w.as_ptr(), x.qs.as_ptr());
-            let mut acc = [_mm256_setzero_ps(); 2];
-            for i in 0..nb {
-                let b = wp.add(34 * i);
-                let p = dot_i8_i8(load(b.add(2)), loadx(xq.add(32 * i)));
-                acc[i & 1] = fma_i32(acc[i & 1], p, f16(b) * x.d[i]);
-            }
-            hsum(_mm256_add_ps(acc[0], acc[1]))
-        }
-    }
-
-    #[target_feature(enable = "avx2,fma,f16c")]
-    pub unsafe fn dot_q4k(w: &[u8], x: Q8Slice<'_>) -> f32 {
-        unsafe {
-            let nsb = x.d.len() / 8;
-            assert!(w.len() >= 144 * nsb && x.qs.len() >= 256 * nsb && x.s.len() >= 8 * nsb);
-            let m4 = _mm256_set1_epi8(0x0F);
-            let mut acc_lo = _mm256_setzero_ps();
-            let mut acc_hi = _mm256_setzero_ps();
-            let mut mins = 0.0f32;
-            for i in 0..nsb {
-                let b = w.as_ptr().add(144 * i);
-                let (d, dmin) = (f16(b), f16(b.add(2)));
-                let scales = &w[144 * i + 4..144 * i + 16];
-                let xq = x.qs.as_ptr().add(256 * i);
-                for j in 0..4 {
-                    // 32 bytes: low nibbles are sub-block 2j, high nibbles 2j + 1
-                    let v = load(b.add(16 + 32 * j));
-                    let lo = _mm256_and_si256(v, m4);
-                    let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(v), m4);
-                    let (s1, m1) = scale_min_k4(2 * j, scales);
-                    let (s2, m2) = scale_min_k4(2 * j + 1, scales);
-                    let (xa, xb) = (8 * i + 2 * j, 8 * i + 2 * j + 1);
-                    acc_lo = fma_i32(
-                        acc_lo,
-                        dot_u8_i8(lo, loadx(xq.add(64 * j))),
-                        d * s1 as f32 * x.d[xa],
-                    );
-                    acc_hi = fma_i32(
-                        acc_hi,
-                        dot_u8_i8(hi, loadx(xq.add(64 * j + 32))),
-                        d * s2 as f32 * x.d[xb],
-                    );
-                    mins += dmin * (m1 as f32 * x.s[xa] + m2 as f32 * x.s[xb]);
+                /// Products of signed bytes `a` and `s`, summed into 8 i32
+                #[inline]
+                #[target_feature(enable = $feat)]
+                fn dot_i8_i8(a: __m256i, s: __m256i) -> __m256i {
+                    dot_u8_i8(_mm256_sign_epi8(a, a), _mm256_sign_epi8(s, a))
                 }
-            }
-            hsum(_mm256_add_ps(acc_lo, acc_hi)) - mins
-        }
-    }
 
-    #[target_feature(enable = "avx2,fma,f16c")]
-    pub unsafe fn dot_q5k(w: &[u8], x: Q8Slice<'_>) -> f32 {
-        unsafe {
-            let nsb = x.d.len() / 8;
-            assert!(w.len() >= 176 * nsb && x.qs.len() >= 256 * nsb && x.s.len() >= 8 * nsb);
-            let m4 = _mm256_set1_epi8(0x0F);
-            let b16 = _mm256_set1_epi8(16);
-            // 16 where bit `bit` of the high-bit byte is set
-            let high = |qh: __m256i, bit: usize| {
-                let m = _mm256_set1_epi8((1u8 << bit) as i8);
-                _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh, m), m), b16)
-            };
-            let mut acc_lo = _mm256_setzero_ps();
-            let mut acc_hi = _mm256_setzero_ps();
-            let mut mins = 0.0f32;
-            for i in 0..nsb {
-                let b = w.as_ptr().add(176 * i);
-                let (d, dmin) = (f16(b), f16(b.add(2)));
-                let scales = &w[176 * i + 4..176 * i + 16];
-                let qh = load(b.add(16));
-                let xq = x.qs.as_ptr().add(256 * i);
-                for j in 0..4 {
-                    let v = load(b.add(48 + 32 * j));
-                    let lo = _mm256_or_si256(_mm256_and_si256(v, m4), high(qh, 2 * j));
-                    let hi = _mm256_or_si256(
-                        _mm256_and_si256(_mm256_srli_epi16::<4>(v), m4),
-                        high(qh, 2 * j + 1),
-                    );
-                    let (s1, m1) = scale_min_k4(2 * j, scales);
-                    let (s2, m2) = scale_min_k4(2 * j + 1, scales);
-                    let (xa, xb) = (8 * i + 2 * j, 8 * i + 2 * j + 1);
-                    acc_lo = fma_i32(
-                        acc_lo,
-                        dot_u8_i8(lo, loadx(xq.add(64 * j))),
-                        d * s1 as f32 * x.d[xa],
-                    );
-                    acc_hi = fma_i32(
-                        acc_hi,
-                        dot_u8_i8(hi, loadx(xq.add(64 * j + 32))),
-                        d * s2 as f32 * x.d[xb],
-                    );
-                    mins += dmin * (m1 as f32 * x.s[xa] + m2 as f32 * x.s[xb]);
+                #[target_feature(enable = $feat)]
+                pub unsafe fn dot_q4_0(w: &[u8], x: Q8Slice<'_>) -> f32 {
+                    unsafe {
+                        let nb = x.d.len();
+                        assert!(w.len() >= 18 * nb && x.qs.len() >= 32 * nb);
+                        let (wp, xq) = (w.as_ptr(), x.qs.as_ptr());
+                        let s8 = _mm256_set1_epi8(8);
+                        let mut acc = [_mm256_setzero_ps(); 2];
+                        for i in 0..nb {
+                            let b = wp.add(18 * i);
+                            let q = _mm256_sub_epi8(q4_nibbles(b.add(2)), s8);
+                            acc[i & 1] = fma_i32(
+                                acc[i & 1],
+                                dot_i8_i8(q, loadx(xq.add(32 * i))),
+                                f16(b) * x.d[i],
+                            );
+                        }
+                        hsum(_mm256_add_ps(acc[0], acc[1]))
+                    }
                 }
-            }
-            hsum(_mm256_add_ps(acc_lo, acc_hi)) - mins
-        }
-    }
 
-    #[target_feature(enable = "avx2,fma,f16c")]
-    pub unsafe fn dot_q6k(w: &[u8], x: Q8Slice<'_>) -> f32 {
-        unsafe {
-            let nsb = x.d.len() / 8;
-            assert!(w.len() >= 210 * nsb && x.qs.len() >= 256 * nsb);
-            let m4 = _mm256_set1_epi8(0x0F);
-            let m3 = _mm256_set1_epi8(0x03);
-            let s32 = _mm256_set1_epi8(32);
-            let mut acc = [_mm256_setzero_ps(); 2];
-            for i in 0..nsb {
-                let b = w.as_ptr().add(210 * i);
-                let d = f16(b.add(208));
-                let xq = x.qs.as_ptr().add(256 * i);
-                for n in 0..2 {
-                    let ql0 = load(b.add(64 * n));
-                    let ql1 = load(b.add(64 * n + 32));
-                    let qh = load(b.add(128 + 32 * n));
-                    let sc = b.add(192 + 8 * n) as *const i8;
-                    // 6-bit values in 0..64 (the -32 offset is applied below)
-                    let mk = |lo: __m256i, h: __m256i| {
-                        _mm256_or_si256(lo, _mm256_slli_epi16::<4>(_mm256_and_si256(h, m3)))
-                    };
-                    let q = [
-                        mk(_mm256_and_si256(ql0, m4), qh),
-                        mk(_mm256_and_si256(ql1, m4), _mm256_srli_epi16::<2>(qh)),
-                        mk(
-                            _mm256_and_si256(_mm256_srli_epi16::<4>(ql0), m4),
-                            _mm256_srli_epi16::<4>(qh),
-                        ),
-                        mk(
-                            _mm256_and_si256(_mm256_srli_epi16::<4>(ql1), m4),
-                            _mm256_srli_epi16::<6>(qh),
-                        ),
-                    ];
-                    for (k, &q) in q.iter().enumerate() {
-                        let xv = loadx(xq.add(128 * n + 32 * k));
-                        let p = _mm256_sub_epi16(
-                            _mm256_maddubs_epi16(q, xv),
-                            _mm256_maddubs_epi16(s32, xv),
+                #[target_feature(enable = $feat)]
+                pub unsafe fn dot_q4_1(w: &[u8], x: Q8Slice<'_>) -> f32 {
+                    unsafe {
+                        let nb = x.d.len();
+                        assert!(w.len() >= 20 * nb && x.qs.len() >= 32 * nb && x.s.len() >= nb);
+                        let (wp, xq) = (w.as_ptr(), x.qs.as_ptr());
+                        let mut acc = [_mm256_setzero_ps(); 2];
+                        let mut summs = 0.0f32;
+                        for i in 0..nb {
+                            let b = wp.add(20 * i);
+                            let p = dot_u8_i8(q4_nibbles(b.add(4)), loadx(xq.add(32 * i)));
+                            acc[i & 1] = fma_i32(acc[i & 1], p, f16(b) * x.d[i]);
+                            summs += f16(b.add(2)) * x.s[i];
+                        }
+                        hsum(_mm256_add_ps(acc[0], acc[1])) + summs
+                    }
+                }
+
+                /// One q4_1 row against four activation rows: the block is unpacked once
+                #[target_feature(enable = $feat)]
+                pub unsafe fn dot_q4_1_x4(w: &[u8], x: [Q8Slice<'_>; 4]) -> [f32; 4] {
+                    unsafe {
+                        let nb = x[0].d.len();
+                        assert!(w.len() >= 20 * nb);
+                        assert!(
+                            x.iter().all(|x| x.qs.len() >= 32 * nb
+                                && x.d.len() >= nb
+                                && x.s.len() >= nb)
                         );
-                        // 16 elements per scale: i16 lanes 0..8 and 8..16
-                        let scl = _mm256_set_m128i(
-                            _mm_set1_epi16(*sc.add(2 * k + 1) as i16),
-                            _mm_set1_epi16(*sc.add(2 * k) as i16),
+                        let wp = w.as_ptr();
+                        let mut acc = [_mm256_setzero_ps(); 4];
+                        let mut summs = [0.0f32; 4];
+                        for i in 0..nb {
+                            let b = wp.add(20 * i);
+                            let q = q4_nibbles(b.add(4));
+                            let (d, m) = (f16(b), f16(b.add(2)));
+                            for t in 0..4 {
+                                let p = dot_u8_i8(q, loadx(x[t].qs.as_ptr().add(32 * i)));
+                                acc[t] = fma_i32(acc[t], p, d * *x[t].d.get_unchecked(i));
+                                summs[t] += m * *x[t].s.get_unchecked(i);
+                            }
+                        }
+                        core::array::from_fn(|t| hsum(acc[t]) + summs[t])
+                    }
+                }
+
+                #[target_feature(enable = $feat)]
+                pub unsafe fn dot_q8_0(w: &[u8], x: Q8Slice<'_>) -> f32 {
+                    unsafe {
+                        let nb = x.d.len();
+                        assert!(w.len() >= 34 * nb && x.qs.len() >= 32 * nb);
+                        let (wp, xq) = (w.as_ptr(), x.qs.as_ptr());
+                        let mut acc = [_mm256_setzero_ps(); 2];
+                        for i in 0..nb {
+                            let b = wp.add(34 * i);
+                            let p = dot_i8_i8(load(b.add(2)), loadx(xq.add(32 * i)));
+                            acc[i & 1] = fma_i32(acc[i & 1], p, f16(b) * x.d[i]);
+                        }
+                        hsum(_mm256_add_ps(acc[0], acc[1]))
+                    }
+                }
+
+                #[target_feature(enable = $feat)]
+                pub unsafe fn dot_q4k(w: &[u8], x: Q8Slice<'_>) -> f32 {
+                    unsafe {
+                        let nsb = x.d.len() / 8;
+                        assert!(
+                            w.len() >= 144 * nsb && x.qs.len() >= 256 * nsb && x.s.len() >= 8 * nsb
                         );
-                        acc[k & 1] = fma_i32(
-                            acc[k & 1],
-                            _mm256_madd_epi16(p, scl),
-                            d * x.d[8 * i + 4 * n + k],
+                        let m4 = _mm256_set1_epi8(0x0F);
+                        let mut acc_lo = _mm256_setzero_ps();
+                        let mut acc_hi = _mm256_setzero_ps();
+                        let mut mins = 0.0f32;
+                        for i in 0..nsb {
+                            let b = w.as_ptr().add(144 * i);
+                            let (d, dmin) = (f16(b), f16(b.add(2)));
+                            let scales = &w[144 * i + 4..144 * i + 16];
+                            let xq = x.qs.as_ptr().add(256 * i);
+                            for j in 0..4 {
+                                // 32 bytes: low nibbles are sub-block 2j, high nibbles 2j + 1
+                                let v = load(b.add(16 + 32 * j));
+                                let lo = _mm256_and_si256(v, m4);
+                                let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(v), m4);
+                                let (s1, m1) = scale_min_k4(2 * j, scales);
+                                let (s2, m2) = scale_min_k4(2 * j + 1, scales);
+                                let (xa, xb) = (8 * i + 2 * j, 8 * i + 2 * j + 1);
+                                acc_lo = fma_i32(
+                                    acc_lo,
+                                    dot_u8_i8(lo, loadx(xq.add(64 * j))),
+                                    d * s1 as f32 * x.d[xa],
+                                );
+                                acc_hi = fma_i32(
+                                    acc_hi,
+                                    dot_u8_i8(hi, loadx(xq.add(64 * j + 32))),
+                                    d * s2 as f32 * x.d[xb],
+                                );
+                                mins += dmin * (m1 as f32 * x.s[xa] + m2 as f32 * x.s[xb]);
+                            }
+                        }
+                        hsum(_mm256_add_ps(acc_lo, acc_hi)) - mins
+                    }
+                }
+
+                #[target_feature(enable = $feat)]
+                pub unsafe fn dot_q5k(w: &[u8], x: Q8Slice<'_>) -> f32 {
+                    unsafe {
+                        let nsb = x.d.len() / 8;
+                        assert!(
+                            w.len() >= 176 * nsb && x.qs.len() >= 256 * nsb && x.s.len() >= 8 * nsb
                         );
+                        let m4 = _mm256_set1_epi8(0x0F);
+                        let b16 = _mm256_set1_epi8(16);
+                        // 16 where bit `bit` of the high-bit byte is set
+                        let high = |qh: __m256i, bit: usize| {
+                            let m = _mm256_set1_epi8((1u8 << bit) as i8);
+                            _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh, m), m), b16)
+                        };
+                        let mut acc_lo = _mm256_setzero_ps();
+                        let mut acc_hi = _mm256_setzero_ps();
+                        let mut mins = 0.0f32;
+                        for i in 0..nsb {
+                            let b = w.as_ptr().add(176 * i);
+                            let (d, dmin) = (f16(b), f16(b.add(2)));
+                            let scales = &w[176 * i + 4..176 * i + 16];
+                            let qh = load(b.add(16));
+                            let xq = x.qs.as_ptr().add(256 * i);
+                            for j in 0..4 {
+                                let v = load(b.add(48 + 32 * j));
+                                let lo = _mm256_or_si256(_mm256_and_si256(v, m4), high(qh, 2 * j));
+                                let hi = _mm256_or_si256(
+                                    _mm256_and_si256(_mm256_srli_epi16::<4>(v), m4),
+                                    high(qh, 2 * j + 1),
+                                );
+                                let (s1, m1) = scale_min_k4(2 * j, scales);
+                                let (s2, m2) = scale_min_k4(2 * j + 1, scales);
+                                let (xa, xb) = (8 * i + 2 * j, 8 * i + 2 * j + 1);
+                                acc_lo = fma_i32(
+                                    acc_lo,
+                                    dot_u8_i8(lo, loadx(xq.add(64 * j))),
+                                    d * s1 as f32 * x.d[xa],
+                                );
+                                acc_hi = fma_i32(
+                                    acc_hi,
+                                    dot_u8_i8(hi, loadx(xq.add(64 * j + 32))),
+                                    d * s2 as f32 * x.d[xb],
+                                );
+                                mins += dmin * (m1 as f32 * x.s[xa] + m2 as f32 * x.s[xb]);
+                            }
+                        }
+                        hsum(_mm256_add_ps(acc_lo, acc_hi)) - mins
+                    }
+                }
+
+                #[target_feature(enable = $feat)]
+                pub unsafe fn dot_q6k(w: &[u8], x: Q8Slice<'_>) -> f32 {
+                    unsafe {
+                        let nsb = x.d.len() / 8;
+                        assert!(w.len() >= 210 * nsb && x.qs.len() >= 256 * nsb);
+                        let m4 = _mm256_set1_epi8(0x0F);
+                        let m3 = _mm256_set1_epi8(0x03);
+                        let s32 = _mm256_set1_epi8(32);
+                        let mut acc = [_mm256_setzero_ps(); 2];
+                        for i in 0..nsb {
+                            let b = w.as_ptr().add(210 * i);
+                            let d = f16(b.add(208));
+                            let xq = x.qs.as_ptr().add(256 * i);
+                            for n in 0..2 {
+                                let ql0 = load(b.add(64 * n));
+                                let ql1 = load(b.add(64 * n + 32));
+                                let qh = load(b.add(128 + 32 * n));
+                                let sc = b.add(192 + 8 * n) as *const i8;
+                                // 6-bit values in 0..64 (the -32 offset is applied below)
+                                let mk = |lo: __m256i, h: __m256i| {
+                                    _mm256_or_si256(
+                                        lo,
+                                        _mm256_slli_epi16::<4>(_mm256_and_si256(h, m3)),
+                                    )
+                                };
+                                let q = [
+                                    mk(_mm256_and_si256(ql0, m4), qh),
+                                    mk(_mm256_and_si256(ql1, m4), _mm256_srli_epi16::<2>(qh)),
+                                    mk(
+                                        _mm256_and_si256(_mm256_srli_epi16::<4>(ql0), m4),
+                                        _mm256_srli_epi16::<4>(qh),
+                                    ),
+                                    mk(
+                                        _mm256_and_si256(_mm256_srli_epi16::<4>(ql1), m4),
+                                        _mm256_srli_epi16::<6>(qh),
+                                    ),
+                                ];
+                                for (k, &q) in q.iter().enumerate() {
+                                    let xv = loadx(xq.add(128 * n + 32 * k));
+                                    let p = _mm256_sub_epi16(
+                                        _mm256_maddubs_epi16(q, xv),
+                                        _mm256_maddubs_epi16(s32, xv),
+                                    );
+                                    // 16 elements per scale: i16 lanes 0..8 and 8..16
+                                    let scl = _mm256_set_m128i(
+                                        _mm_set1_epi16(*sc.add(2 * k + 1) as i16),
+                                        _mm_set1_epi16(*sc.add(2 * k) as i16),
+                                    );
+                                    acc[k & 1] = fma_i32(
+                                        acc[k & 1],
+                                        _mm256_madd_epi16(p, scl),
+                                        d * x.d[8 * i + 4 * n + k],
+                                    );
+                                }
+                            }
+                        }
+                        hsum(_mm256_add_ps(acc[0], acc[1]))
                     }
                 }
             }
-            hsum(_mm256_add_ps(acc[0], acc[1]))
-        }
+        };
     }
+
+    int8_kernels!(avx2, "avx2,fma,f16c", |u, s| _mm256_madd_epi16(
+        _mm256_maddubs_epi16(u, s),
+        _mm256_set1_epi16(1)
+    ));
+    int8_kernels!(vnni, "avx2,fma,f16c,avxvnni", |u, s| {
+        _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), u, s)
+    });
 }
 
 #[cfg(test)]
@@ -1488,6 +1556,61 @@ mod tests {
             && is_x86_feature_detected!("fma")
             && is_x86_feature_detected!("f16c");
         assert_eq!(x86::has_avx2(), std);
+        let vnni = std && is_x86_feature_detected!("avxvnni");
+        assert_eq!(x86::level() == x86::Level::AvxVnni, vnni);
+    }
+
+    /// The VNNI kernels give the AVX2 kernels' results bit for bit
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn vnni_matches_avx2() {
+        if x86::level() < x86::Level::AvxVnni {
+            return;
+        }
+        use x86::{avx2, vnni};
+        type Kernel = unsafe fn(&[u8], Q8Slice<'_>) -> f32;
+        let mut seed = 0x0bad_cafe_dead_beefu64;
+        let n = 1024;
+        let x: Vec<f32> = (0..n)
+            .map(|i| ((i * 7919) % 211) as f32 / 50.0 - 2.0)
+            .collect();
+        // full-range activations, -127 and 127 included
+        let xs: [Vec<f32>; 4] = core::array::from_fn(|t| {
+            x.iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    if i % 5 == t {
+                        1e3 * v.signum()
+                    } else {
+                        v * (t as f32 - 1.5)
+                    }
+                })
+                .collect()
+        });
+        let xqs: Vec<Q8Act> = xs.iter().map(|x| Q8Act::quantize(x)).collect();
+        let pairs: [(GgmlType, Kernel, Kernel); 6] = [
+            (GgmlType::Q4_0, avx2::dot_q4_0, vnni::dot_q4_0),
+            (GgmlType::Q4_1, avx2::dot_q4_1, vnni::dot_q4_1),
+            (GgmlType::Q8_0, avx2::dot_q8_0, vnni::dot_q8_0),
+            (GgmlType::Q4K, avx2::dot_q4k, vnni::dot_q4k),
+            (GgmlType::Q5K, avx2::dot_q5k, vnni::dot_q5k),
+            (GgmlType::Q6K, avx2::dot_q6k, vnni::dot_q6k),
+        ];
+        for (ty, a, b) in pairs {
+            let mut w = rand_row(ty, n, &mut seed);
+            if ty == GgmlType::Q8_0 {
+                // -128, the weight the sign trick can't negate
+                w[2] = 0x80;
+            }
+            for xq in &xqs {
+                let (a, b) = unsafe { (a(&w, xq.slice(0, n)), b(&w, xq.slice(0, n))) };
+                assert_eq!(a.to_bits(), b.to_bits(), "{ty:?}: {a} vs {b}");
+            }
+        }
+        let w = rand_row(GgmlType::Q4_1, n, &mut seed);
+        let x4 = core::array::from_fn(|t| xqs[t].slice(0, n));
+        let (a, b) = unsafe { (avx2::dot_q4_1_x4(&w, x4), vnni::dot_q4_1_x4(&w, x4)) };
+        assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits));
     }
 
     fn rand_bytes(n: usize, seed: &mut u64) -> Vec<u8> {

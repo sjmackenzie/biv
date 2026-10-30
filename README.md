@@ -1,9 +1,9 @@
 # biv — Brain In a Vat
 
 Pure Rust chat inference for **Qwen3.8** GGUF models (llama.cpp architecture
-`qwen35`), on Apple GPUs (Metal) or the CPU (aarch64 NEON, x86-64 AVX2). No
+`qwen35`), on Apple GPUs (Metal) or the CPU (aarch64 NEON, x86-64 AVX2 or AVX-VNNI). No
 C/C++ code and no bindings: the GGUF loader, the quantized kernels (NEON `sdot`,
-AVX2 `maddubs`, Metal shaders), the tokenizer, and the model graph are all in Rust
+AVX2 `maddubs`, VNNI `vpdpbusd`, Metal shaders), the tokenizer, and the model graph are all in Rust
 or MSL.
 
 ```sh
@@ -16,7 +16,9 @@ cargo build --release
 
 On x86-64 the AVX2 + FMA + F16C kernels (Haswell, Zen and later) are picked at run
 time, so a default build runs on any x86-64 CPU and falls back to scalar code
-without AVX2. `RUSTFLAGS="-C target-cpu=native"` additionally lets the compiler
+without AVX2. On CPUs with AVX-VNNI (Alder Lake, Zen 5 and later) the int8
+products use `vpdpbusd` instead of `maddubs` + `madd`. The two give the same
+results bit for bit. `RUSTFLAGS="-C target-cpu=native"` additionally lets the compiler
 use AVX2 in the non-kernel code (norms, softmax, sampling).
 
 On macOS the Metal backend is the default. Its shaders are compiled from source
@@ -103,7 +105,7 @@ time either way (cpuid). Its features:
 | file | role |
 |---|---|
 | `engine/src/gguf.rs` | GGUF parser over in-memory shards, split files |
-| `engine/src/quant.rs` | block formats (dequant for Q2_K…Q8_0, F16, BF16), int8 activations, NEON and AVX2 dot kernels with scalar references |
+| `engine/src/quant.rs` | block formats (dequant for Q2_K…Q8_0, F16, BF16), int8 activations, NEON, AVX2 and AVX-VNNI dot kernels with scalar references |
 | `engine/src/ops.rs` | matmul (threaded with rayon), norms, rope, softmax |
 | `engine/src/par.rs` | rayon's parallel iterators, or sequential ones of the same names |
 | `engine/src/math.rs` | libm float functions without `std` |
@@ -169,7 +171,8 @@ whose caches are f32).
   Apple silicon through Rosetta. It runs AVX2 code but only advertises it when
   asked: `ROSETTA_ADVERTISE_AVX=1 cargo test --workspace --release --target
   x86_64-apple-darwin` (without the variable, the same command tests the scalar
-  fallback). The x86-64 build under Rosetta also generates the same greedy text
+  fallback). Rosetta has no AVX-VNNI. On a CPU with it, the tests also check
+  that the VNNI kernels give the AVX2 kernels' results bit for bit. The x86-64 build under Rosetta also generates the same greedy text
   as the native build. Rosetta timings are not representative of x86 hardware.
 - Tokenization of the test prompts matches `llama-tokenize` exactly.
 - Greedy generation matches llama.cpp (`llama-simple -ngl 0`) token for token
@@ -248,8 +251,10 @@ arrays went to memory and the kernel was slower than split-K.
 
 - Ctrl-C during a long prefill.
 - i8mm (`smmla`) CPU prompt kernel; f16 KV cache on CPU.
-- AVX-VNNI / AVX-512 VNNI (`vpdpbusd`) kernels for x86-64. They are not testable
-  under Rosetta, so they need real hardware.
+- AVX-512 (VNNI) kernels for x86-64, 64 bytes per instruction. They are not
+  testable under Rosetta, so they need real hardware. AVX-VNNI alone gains
+  little: it saves one instruction per 32 products, while the per-block float
+  scaling dominates.
 - Matvec kernels that read the weights once for 2–4 tokens, for longer drafts.
   Looping over the tokens inside a simdgroup (weights in registers) was slower
   than a threadgroup per token for Q4_1: the per-token activation loads dominate.
