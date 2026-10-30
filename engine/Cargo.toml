@@ -2,6 +2,7 @@
 name = "biv"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.98"
 license = "MIT OR Apache-2.0"
 description = "Small inference engine: GGUF parsing, quantized kernels, model graph, tokenizer, sampling, chat"
 

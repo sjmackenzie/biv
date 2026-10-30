@@ -4,7 +4,7 @@ Pure Rust chat inference for **Qwen3.8** GGUF models (llama.cpp architecture
 `qwen35`), on Apple GPUs (Metal) or the CPU (aarch64 NEON, x86-64 AVX2 or AVX-VNNI). No
 C/C++ code and no bindings: the GGUF loader, the quantized kernels (NEON `sdot`,
 AVX2 `maddubs`, VNNI `vpdpbusd`, Metal shaders), the tokenizer, and the model graph are all in Rust
-or MSL.
+or MSL. It needs Rust 1.98 or later, for the NEON dot product intrinsics.
 
 ```sh
 cargo build --release
