@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use biv::chat::{Chat, ChatOptions, Event, ReasoningEffort, TurnStats};
 use biv::engine::Engine;
-use biv::gguf::{Gguf, Value};
+use biv::gguf::Gguf;
 use biv::model::Model;
 use biv::sampler::{Sampler, SamplerConfig};
 use biv::tokenizer::Tokenizer;
@@ -253,10 +253,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     let model = Model::load(&gguf)?;
     let engine = make_engine(&model, args.cpu, args.opts.batch)?;
     let name = gguf
-        .get("general.name")
-        .and_then(Value::as_str)
-        .unwrap_or("model")
-        .to_string();
+        .metadata
+        .general
+        .name
+        .clone()
+        .unwrap_or_else(|| "model".into());
     eprintln!(
         "loaded {name} ({}) in {:.1}s: {} layers, {}",
         path.file_name().unwrap_or_default().to_string_lossy(),
@@ -266,21 +267,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     );
 
     // sampling defaults recommended by the model's publisher
-    let gf = |k: &str| gguf.get(k).and_then(Value::as_f32);
+    let sampling = &gguf.metadata.general.sampling;
     let defaults = SamplerConfig::default();
     let sampler_cfg = SamplerConfig {
-        temperature: args
-            .temp
-            .or(gf("general.sampling.temp"))
-            .unwrap_or(defaults.temperature),
+        temperature: args.temp.or(sampling.temp).unwrap_or(defaults.temperature),
         top_k: args
             .top_k
-            .or(gf("general.sampling.top_k").map(|v| v as usize))
+            .or(sampling.top_k.map(|v| v as usize))
             .unwrap_or(defaults.top_k),
-        top_p: args
-            .top_p
-            .or(gf("general.sampling.top_p"))
-            .unwrap_or(defaults.top_p),
+        top_p: args.top_p.or(sampling.top_p).unwrap_or(defaults.top_p),
         min_p: args.min_p,
         presence_penalty: args.presence_penalty,
         repeat_penalty: args.repeat_penalty,

@@ -5,7 +5,7 @@ use hashbrown::HashMap;
 use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
 
 use crate::Error;
-use crate::gguf::{Gguf, Value};
+use crate::gguf::{Gguf, need};
 use crate::prelude::*;
 
 const TOKEN_TYPE_CONTROL: i64 = 3;
@@ -61,28 +61,19 @@ fn byte_to_unicode() -> [char; 256] {
 
 impl Tokenizer {
     pub fn from_gguf(gguf: &Gguf) -> Result<Self, Error> {
-        let model = gguf.str("tokenizer.ggml.model")?;
-        let pre = gguf.str("tokenizer.ggml.pre").unwrap_or("qwen35");
+        let m = &gguf.metadata;
+        let ggml = &m.tokenizer.ggml;
+        let model = need!(m, tokenizer.ggml.model)?;
+        let pre = ggml.pre.as_deref().unwrap_or("qwen35");
         if model != "gpt2" || pre != "qwen35" {
             return Err(Error::UnsupportedTokenizer {
-                model: model.into(),
+                model: model.clone(),
                 pre: pre.into(),
             });
         }
-        let list = |key: &str| {
-            gguf.get(key)
-                .and_then(Value::as_array)
-                .ok_or_else(|| Error::MissingKey(key.into()))
-        };
-        let tokens: Vec<String> = list("tokenizer.ggml.tokens")?
-            .iter()
-            .map(|v| v.as_str().unwrap_or_default().to_string())
-            .collect();
-        let types: Vec<i64> = match gguf
-            .get("tokenizer.ggml.token_type")
-            .and_then(Value::as_array)
-        {
-            Some(a) => a.iter().map(|v| v.as_u64().unwrap_or(1) as i64).collect(),
+        let tokens: Vec<String> = need!(m, tokenizer.ggml.tokens)?.clone();
+        let types: Vec<i64> = match &ggml.token_type {
+            Some(a) => a.iter().map(|&t| t.into()).collect(),
             None => vec![1; tokens.len()],
         };
 
@@ -124,8 +115,8 @@ impl Tokenizer {
         }
 
         let mut merges = HashMap::new();
-        for (rank, m) in list("tokenizer.ggml.merges")?.iter().enumerate() {
-            let Some((l, r)) = m.as_str().and_then(|m| m.split_once(' ')) else {
+        for (rank, merge) in need!(m, tokenizer.ggml.merges)?.iter().enumerate() {
+            let Some((l, r)) = merge.split_once(' ') else {
                 continue;
             };
             let (Some(&li), Some(&ri), Some(&mi)) = (
@@ -146,9 +137,7 @@ impl Tokenizer {
             .collect();
         specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
-        let id = |key: &str| gguf.get(key).and_then(Value::as_u64).map(|v| v as TokenId);
-        let eos_key = "tokenizer.ggml.eos_token_id";
-        let eos = id(eos_key).ok_or_else(|| Error::MissingKey(eos_key.into()))?;
+        let eos = *need!(m, tokenizer.ggml.eos_token_id)?;
         let mut eog = vec![eos];
         for t in ["<|im_end|>", "<|endoftext|>", "<|end_of_text|>"] {
             if let Some(&i) = token_to_id.get(t)
@@ -166,7 +155,7 @@ impl Tokenizer {
             merges,
             byte_tokens,
             specials,
-            bos: id("tokenizer.ggml.bos_token_id"),
+            bos: ggml.bos_token_id,
             eos,
             eog,
         })

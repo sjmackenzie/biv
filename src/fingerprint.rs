@@ -15,7 +15,7 @@ use std::path::Path;
 
 use biv::chat::{Chat, ChatOptions, Event};
 use biv::engine::Engine;
-use biv::gguf::{Gguf, Value};
+use biv::gguf::Gguf;
 use biv::sampler::{Sampler, SamplerConfig};
 use biv::tokenizer::{TokenId, Tokenizer};
 
@@ -197,9 +197,12 @@ pub fn stack(
     generation: &Generation<'_>,
 ) -> Fingerprint {
     let mut f = Fingerprint::default();
-    let meta = |k: &str| gguf.get(k).and_then(Value::as_str).unwrap_or_default();
-    f.push("model.name", meta("general.name"));
-    f.push("model.architecture", meta("general.architecture"));
+    let general = &gguf.metadata.general;
+    f.push("model.name", general.name.as_deref().unwrap_or_default());
+    f.push(
+        "model.architecture",
+        general.architecture.as_deref().unwrap_or_default(),
+    );
     if let Some(sum) = model_sha256 {
         f.push("model.sha256", hex(&sum));
     }

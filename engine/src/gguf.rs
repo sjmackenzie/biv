@@ -1,10 +1,17 @@
 //! GGUF container reader: metadata key/values and tensors, over the bytes of
 //! the file (typically a memory mapping, owned by the [`Gguf`]).
 //!
+//! The metadata is read into the nested structs of [`Metadata`], one level
+//! per component of the dotted keys.
+//!
 //! Split files (`-00001-of-0000N.gguf`) are parsed together; tensor data of
 //! each shard stays in its own buffer.
 
+mod metadata;
+
 use hashbrown::HashMap;
+
+pub use metadata::*;
 
 use crate::Error;
 use crate::prelude::*;
@@ -94,7 +101,10 @@ impl TensorInfo {
 pub type Shard = Box<dyn AsRef<[u8]> + Send + Sync>;
 
 pub struct Gguf {
-    pub metadata: HashMap<String, Value>,
+    pub metadata: Metadata,
+    /// the keys with no field in [`Metadata`], or a value of another type
+    /// than their field's, in file order
+    pub extra: Vec<(String, Value)>,
     pub tensors: HashMap<String, TensorInfo>,
     /// tensor names in file order
     pub tensor_order: Vec<String>,
@@ -167,7 +177,8 @@ impl Gguf {
     /// Parse a GGUF from the contents of its shard files, in order
     pub fn from_shards(shards: Vec<Shard>) -> Result<Self, Error> {
         let mut gguf = Gguf {
-            metadata: HashMap::new(),
+            metadata: Metadata::default(),
+            extra: Vec::new(),
             tensors: HashMap::new(),
             tensor_order: Vec::new(),
             shards: Vec::new(),
@@ -196,7 +207,12 @@ impl Gguf {
             let ty = c.u32()?;
             let value = c.value(ty)?;
             // split shards repeat `split.*` keys; the first shard holds the real metadata
-            self.metadata.entry(key).or_insert(value);
+            if self.contains(&key) {
+                continue;
+            }
+            if let Err(value) = self.metadata.set(&key, value) {
+                self.extra.push((key, value));
+            }
         }
 
         let mut infos = Vec::with_capacity(n_tensors as usize);
@@ -226,9 +242,9 @@ impl Gguf {
 
         let alignment = self
             .metadata
-            .get("general.alignment")
-            .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_ALIGNMENT);
+            .general
+            .alignment
+            .map_or(DEFAULT_ALIGNMENT, u64::from);
         let data_start = (c.pos as u64).div_ceil(alignment) * alignment;
 
         for mut info in infos {
@@ -242,26 +258,28 @@ impl Gguf {
         Ok(())
     }
 
-    pub fn get(&self, key: &str) -> Option<&Value> {
-        self.metadata.get(key)
+    /// Whether the file has `key`
+    pub fn contains(&self, key: &str) -> bool {
+        self.metadata.contains(key) || self.extra.iter().any(|(k, _)| k == key)
     }
 
-    pub fn u64(&self, key: &str) -> Result<u64, Error> {
-        self.get(key)
-            .and_then(Value::as_u64)
-            .ok_or_else(|| Error::MissingKey(key.into()))
+    /// The value of `key`, from [`Metadata`] or `extra`
+    pub fn get(&self, key: &str) -> Option<Value> {
+        self.metadata.get(key).or_else(|| {
+            self.extra
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        })
     }
 
-    pub fn f32(&self, key: &str) -> Result<f32, Error> {
-        self.get(key)
-            .and_then(Value::as_f32)
-            .ok_or_else(|| Error::MissingKey(key.into()))
-    }
-
-    pub fn str(&self, key: &str) -> Result<&str, Error> {
-        self.get(key)
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::MissingKey(key.into()))
+    /// Every key and its value: those of [`Metadata`], then `extra`
+    pub fn entries(&self) -> Vec<(String, Value)> {
+        let mut out = Vec::new();
+        self.metadata
+            .visit("", &mut |k, v| out.push((String::from(k), v)));
+        out.extend(self.extra.iter().cloned());
+        out
     }
 
     pub fn tensor(&self, name: &str) -> Option<(&TensorInfo, &[u8])> {

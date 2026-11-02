@@ -11,7 +11,7 @@
 
 use crate::Error;
 use crate::engine::DraftLogits;
-use crate::gguf::{Gguf, Value};
+use crate::gguf::{Gguf, need};
 #[cfg(not(any(feature = "std", test)))]
 use crate::math::Float;
 use crate::ops::{self, Input, Weight, matmul_new};
@@ -45,39 +45,33 @@ pub struct Config {
 
 impl Config {
     pub fn from_gguf(g: &Gguf) -> Result<Self, Error> {
-        let arch = g.str("general.architecture")?;
+        let m = &g.metadata;
+        let arch = need!(m, general.architecture)?;
         if arch != "qwen35" {
-            return Err(Error::UnsupportedArchitecture(arch.into()));
+            return Err(Error::UnsupportedArchitecture(arch.clone()));
         }
-        let k = |s: &str| format!("{arch}.{s}");
-        let u = |s: &str| g.u64(&k(s)).map(|v| v as usize);
+        let q = &m.qwen35;
+        let u = |v: Option<u64>| v.map(|v| v as usize);
 
-        let block_count = u("block_count")?;
-        let nextn = u("nextn_predict_layers").unwrap_or(0);
+        let block_count = *need!(m, qwen35.block_count)? as usize;
+        let nextn = u(q.nextn_predict_layers).unwrap_or(0);
         let n_layer = block_count - nextn;
-        let n_embd = u("embedding_length")?;
-        let n_head = u("attention.head_count")?;
-        let head_dim = u("attention.key_length").unwrap_or(n_embd / n_head);
-        if u("attention.value_length").unwrap_or(head_dim) != head_dim {
+        let n_embd = *need!(m, qwen35.embedding_length)? as usize;
+        let n_head = *need!(m, qwen35.attention.head_count)? as usize;
+        let head_dim = u(q.attention.key_length).unwrap_or(n_embd / n_head);
+        if u(q.attention.value_length).unwrap_or(head_dim) != head_dim {
             return Err(Error::UnsupportedModel("key_length != value_length"));
         }
-        let recurrent = match g
-            .get(&k("attention.recurrent_layers"))
-            .and_then(Value::as_array)
-        {
-            Some(a) => a
-                .iter()
-                .take(n_layer)
-                .map(|v| v.as_u64() == Some(1))
-                .collect(),
+        let recurrent = match &q.attention.recurrent_layers {
+            Some(a) => a.iter().take(n_layer).copied().collect(),
             None => {
-                let interval = u("full_attention_interval").unwrap_or(4);
+                let interval = u(q.full_attention_interval).unwrap_or(4);
                 (0..n_layer).map(|i| (i + 1) % interval != 0).collect()
             }
         };
-        let ssm_state = u("ssm.state_size")?;
-        let ssm_v_heads = u("ssm.time_step_rank")?;
-        if u("ssm.inner_size")? != ssm_state * ssm_v_heads {
+        let ssm_state = *need!(m, qwen35.ssm.state_size)? as usize;
+        let ssm_v_heads = *need!(m, qwen35.ssm.time_step_rank)? as usize;
+        if *need!(m, qwen35.ssm.inner_size)? as usize != ssm_state * ssm_v_heads {
             return Err(Error::UnsupportedModel(
                 "ssm.inner_size != state_size * time_step_rank",
             ));
@@ -91,19 +85,19 @@ impl Config {
         Ok(Config {
             n_layer,
             n_embd,
-            n_ff: u("feed_forward_length")?,
+            n_ff: *need!(m, qwen35.feed_forward_length)? as usize,
             n_vocab,
             n_head,
-            n_head_kv: u("attention.head_count_kv")?,
+            n_head_kv: *need!(m, qwen35.attention.head_count_kv)? as usize,
             head_dim,
-            n_rot: u("rope.dimension_count").unwrap_or(head_dim),
-            rope_base: g.f32(&k("rope.freq_base")).unwrap_or(10_000.0),
-            eps: g.f32(&k("attention.layer_norm_rms_epsilon"))?,
-            context_length: u("context_length").unwrap_or(4096),
+            n_rot: u(q.rope.dimension_count).unwrap_or(head_dim),
+            rope_base: q.rope.freq_base.unwrap_or(10_000.0),
+            eps: *need!(m, qwen35.attention.layer_norm_rms_epsilon)?,
+            context_length: u(q.context_length).unwrap_or(4096),
             recurrent,
-            conv_kernel: u("ssm.conv_kernel")?,
+            conv_kernel: *need!(m, qwen35.ssm.conv_kernel)? as usize,
             ssm_state,
-            ssm_k_heads: u("ssm.group_count")?,
+            ssm_k_heads: *need!(m, qwen35.ssm.group_count)? as usize,
             ssm_v_heads,
         })
     }
