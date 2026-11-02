@@ -40,6 +40,18 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-Q8_0.gguf   # :Q8_0, 29 GB
 
 Other quants are files of the same repo (`hf download unsloth/Qwen3.8-27B-GGUF
 --dry-run` lists them); `-m hf.co/unsloth/Qwen3.8-27B-GGUF:<quant>` picks one.
+The kernels cover F32, F16, BF16, Q4_0, Q4_1, Q8_0, Q4_K, Q5_K and Q6_K; files
+with other types (IQ*, Q2_K, Q3_K, Q5_0, Q5_1) don't load.
+
+Qwen3.5 dense models have the same architecture. Qwen3.5 4B runs on Metal and the
+CPU, at about 45 tokens/s on an M2 Max (Q8_0):
+
+```sh
+hf download unsloth/Qwen3.5-4B-GGUF Qwen3.5-4B-Q8_0.gguf     # 4.5 GB
+./target/release/biv -m hf.co/unsloth/Qwen3.5-4B-GGUF:Q8_0
+```
+
+Its GGUF has no MTP head, so it decodes without drafting (`--lookup` still works).
 
 Decoding is speculative by default: the model's MTP head drafts the next tokens
 (4 on Metal, 1 on the CPU), and the trunk checks them in the same pass as the
