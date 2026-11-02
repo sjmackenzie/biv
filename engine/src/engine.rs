@@ -10,12 +10,16 @@ use crate::prelude::*;
 use crate::tokenizer::TokenId;
 
 pub trait Engine {
-    /// A new empty sequence able to hold `context` tokens, drafting up to
-    /// `draft` tokens per step when the model has an MTP head
+    /// A new empty sequence able to hold `context` tokens, verifying up to
+    /// `draft` tokens after the chosen one per step, and drafting with the
+    /// model's MTP head when it has one and `draft` isn't 0
     fn new_session(&self, context: usize, draft: usize) -> Result<Box<dyn Session + '_>, Error>;
 
     /// Prompt tokens per forward pass this backend works best with
     fn batch_size(&self) -> usize;
+
+    /// Tokens drafted per step this backend works best with
+    fn draft_size(&self) -> usize;
 
     fn description(&self) -> String;
 
@@ -36,12 +40,20 @@ pub trait Session {
     /// Append `tokens` without computing logits
     fn prefill(&mut self, tokens: &[TokenId]);
 
-    /// Tokens likely to follow `next`, the token chosen after the sequence.
+    /// Up to `n` tokens likely to follow `next`, the token chosen after the
+    /// sequence, at most the session's draft length, each chosen by `pick`
+    /// from the MTP head's logits ([`DraftLogits::argmax`] for the likeliest).
     /// Empty when the session doesn't draft.
-    fn draft(&mut self, next: TokenId) -> Vec<TokenId>;
+    fn draft(
+        &mut self,
+        next: TokenId,
+        n: usize,
+        pick: &mut dyn FnMut(&DraftLogits<'_>) -> TokenId,
+    ) -> Vec<TokenId>;
 
-    /// Append `tokens` provisionally, returning the logits after each one.
-    /// [`Session::keep`] must follow.
+    /// Append `tokens` provisionally, returning the logits after each one:
+    /// the chosen token and up to the session's draft length more, drafted or
+    /// not. [`Session::keep`] must follow.
     fn verify(&mut self, tokens: &[TokenId]) -> Vec<Vec<f32>>;
 
     /// Keep the first `n` tokens of the last verify, dropping the others
@@ -61,6 +73,33 @@ pub trait Session {
     /// engine. The draft length may differ, but a drafting session needs a
     /// snapshot from a drafting one: the MTP head's history is part of it.
     fn restore(&mut self, snapshot: &Snapshot) -> Result<(), Error>;
+}
+
+/// The MTP head's logits for a drafted token: `logits[i]` is for token
+/// `tokens[i]`, or for token `i` when the head covers the whole vocabulary
+pub struct DraftLogits<'a> {
+    pub logits: &'a [f32],
+    pub tokens: Option<&'a [TokenId]>,
+}
+
+impl DraftLogits<'_> {
+    pub fn token(&self, i: usize) -> TokenId {
+        self.tokens.map_or(i as TokenId, |t| t[i])
+    }
+
+    /// The likeliest token
+    pub fn argmax(&self) -> TokenId {
+        self.token(crate::sampler::argmax(self.logits) as usize)
+    }
+
+    /// (token, logit) pairs
+    pub fn candidates(&self) -> Vec<(TokenId, f32)> {
+        self.logits
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| (self.token(i), l))
+            .collect()
+    }
 }
 
 /// The state of a sequence after its tokens, in the layout of the backend that
@@ -107,6 +146,10 @@ impl<T: Engine + ?Sized> Engine for &T {
         (**self).batch_size()
     }
 
+    fn draft_size(&self) -> usize {
+        (**self).draft_size()
+    }
+
     fn description(&self) -> String {
         (**self).description()
     }
@@ -127,6 +170,11 @@ impl Engine for Model<'_> {
 
     fn batch_size(&self) -> usize {
         64
+    }
+
+    // a pass of 2 tokens costs 1.45x one of 1, and the cost grows from there
+    fn draft_size(&self) -> usize {
+        1
     }
 
     fn description(&self) -> String {
@@ -158,8 +206,14 @@ impl Session for CpuSession<'_> {
         self.model.prefill(&mut self.state, tokens)
     }
 
-    fn draft(&mut self, next: TokenId) -> Vec<TokenId> {
-        self.model.draft(&mut self.state, next, self.draft)
+    fn draft(
+        &mut self,
+        next: TokenId,
+        n: usize,
+        pick: &mut dyn FnMut(&DraftLogits<'_>) -> TokenId,
+    ) -> Vec<TokenId> {
+        self.model
+            .draft(&mut self.state, next, n.min(self.draft), pick)
     }
 
     fn verify(&mut self, tokens: &[TokenId]) -> Vec<Vec<f32>> {

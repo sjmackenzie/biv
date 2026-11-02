@@ -141,7 +141,7 @@ fn main() {
         engine,
         &tok,
         ChatOptions {
-            draft: 0,
+            draft: Some(0),
             ..opts.clone()
         },
     )
@@ -153,7 +153,7 @@ fn main() {
         engine,
         &tok,
         ChatOptions {
-            draft: 0,
+            draft: Some(0),
             ..opts.clone()
         },
     )

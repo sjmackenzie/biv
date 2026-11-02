@@ -213,7 +213,10 @@ pub fn stack(
         "generation.batch",
         c.batch.unwrap_or_else(|| engine.batch_size()),
     );
-    f.push("generation.draft", c.draft);
+    f.push(
+        "generation.draft",
+        c.draft.unwrap_or_else(|| engine.draft_size()),
+    );
     f.push("generation.thinking", c.thinking);
     f.push(
         "generation.effort",
@@ -324,7 +327,7 @@ pub fn probe(engine: &dyn Engine, tok: &Tokenizer) -> Result<Fingerprint, biv::E
         pass += 1;
         let next = argmax(&logits);
         let mut tokens = vec![next];
-        tokens.extend(session.draft(next));
+        tokens.extend(session.draft(next, PROBE_DRAFT, &mut |l| l.argmax()));
         let mut rows = session.verify(&tokens);
         let kept = 1
             + (1..tokens.len())
@@ -348,7 +351,7 @@ pub fn probe(engine: &dyn Engine, tok: &Tokenizer) -> Result<Fingerprint, biv::E
         max_tokens: PROBE_CHAT_TOKENS,
         context: PROBE_CONTEXT,
         batch: Some(PROBE_BATCH),
-        draft: 0,
+        draft: Some(0),
         ..Default::default()
     };
     let mut chat = Chat::new(engine, tok, opts)?;

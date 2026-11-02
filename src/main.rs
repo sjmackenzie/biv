@@ -33,7 +33,10 @@ usage: biv [options]
   -t, --threads <n>         CPU compute threads [default: all cores]
   -b, --batch <n>           prompt tokens per forward pass [default: 64 cpu, 256 metal]
   -d, --draft <n>           tokens drafted per step by the model's MTP head for
-                            speculative decoding, 0 to disable [default: 1]
+                            speculative decoding, 0 to disable [default: 1 cpu, 4 metal]
+  -l, --lookup <n>          tokens proposed per step from earlier text of the
+                            conversation when the answer repeats it (quotes,
+                            code edits), 0 to disable [default: 0]
       --temp <f>            temperature, 0 for greedy [default: from the model, 1.0]
       --top-k <n>           [default: from the model, 20]
       --top-p <f>           [default: from the model, 0.95]
@@ -107,7 +110,8 @@ fn parse_args() -> Result<Args, String> {
             "-n" | "--max-tokens" => a.opts.max_tokens = num(&flag, val()?)?,
             "-t" | "--threads" => a.threads = Some(num(&flag, val()?)?),
             "-b" | "--batch" => a.opts.batch = Some(num(&flag, val()?)?),
-            "-d" | "--draft" => a.opts.draft = num(&flag, val()?)?,
+            "-d" | "--draft" => a.opts.draft = Some(num(&flag, val()?)?),
+            "-l" | "--lookup" => a.opts.lookup = num(&flag, val()?)?,
             "--cpu" => a.cpu = true,
             "--temp" => a.temp = Some(num(&flag, val()?)?),
             "--top-k" => a.top_k = Some(num(&flag, val()?)?),
@@ -160,7 +164,15 @@ fn print_stats(s: &TurnStats, prompt_time: Duration, gen_time: Duration, style: 
         s.gen_tokens,
         rate(s.gen_tokens, gen_time),
         if s.drafted > 0 {
-            format!(" | drafts {}/{} right", s.accepted, s.drafted)
+            let lookup = if s.looked_up > 0 {
+                format!(
+                    ", {}/{} from the conversation",
+                    s.looked_up_accepted, s.looked_up
+                )
+            } else {
+                String::new()
+            };
+            format!(" | drafts {}/{} right{lookup}", s.accepted, s.drafted)
         } else {
             String::new()
         },

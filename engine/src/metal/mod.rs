@@ -17,12 +17,11 @@ use objc2_metal::{
 };
 
 use crate::Error;
-use crate::engine::{Engine, Session, Snapshot};
-use crate::model::{Config, Layer, Mixer, Model};
+use crate::engine::{DraftLogits, Engine, Session, Snapshot};
+use crate::model::{Config, DRAFT_CAP, DraftVocab, Layer, Mixer, Model, copy_head_rows};
 use crate::ops::Weight;
 use crate::prelude::*;
 use crate::quant::GgmlType;
-use crate::sampler::argmax;
 use crate::tokenizer::TokenId;
 
 const SOURCE: &str = include_str!("kernels.metal");
@@ -39,10 +38,18 @@ const PAGE: usize = if cfg!(target_arch = "aarch64") {
     4096
 };
 
-/// Matmul inputs up to this many rows use the matvec kernels: a verify pass
-/// of a few tokens costs 1.2x (2 tokens) to 2x (4) a decode step with them,
-/// against 4.5x with the matmul kernels, whose tiles are 32 tokens
-const MV_MAX_ROWS: usize = 4;
+/// Matmul inputs of up to this many rows use the matvec kernels, one
+/// threadgroup per input row: the weights of the second and third mostly come
+/// from the cache (a verify pass of 2 tokens costs 1.2x a decode step, 3 1.6x)
+const MV_MAX_ROWS: usize = 3;
+/// Matmul inputs of up to this many rows use the `mmv` kernels, which read the
+/// weights once for 8 input rows (on an M2 Max, a pass of 4 to 8 tokens costs
+/// 1.75-1.9x a decode step, 12 to 16 3.2-3.4x); more use the `mm`
+/// kernels, whose tiles are 32 rows (~4.7x from 5 to 32 tokens)
+const MMV_MAX_ROWS: usize = 16;
+/// Input rows and weight rows (2 simdgroups of 8) per `mmv` threadgroup
+const MMV_ROWS: usize = 8;
+const MMV_WEIGHT_ROWS: usize = 16;
 
 /// Attention positions per split-K range, at least
 const ATTN_CHUNK: usize = 32;
@@ -63,6 +70,12 @@ const ATTN_FLASH_MIN: usize = 32;
 const ATTN_FLASH_R: usize = 16;
 const ATTN_FLASH_C: usize = 64;
 const ATTN_FLASH_NSG: usize = 4;
+/// Verify batches (2 tokens to `ATTN_FLASH_MIN`) of a sequence of at least
+/// this many tokens use the split `attn_flash` kernel, which reads each K / V
+/// tile once for all the tokens and heads of a block rather than once per
+/// token: 13% less for a 5-token verify at 32k positions on M2 Max. Shorter,
+/// its ranges are too short for its overheads.
+const ATTN_FLASH_SPLIT_CTX: usize = 2048;
 
 #[repr(C)]
 struct MatArgs {
@@ -138,6 +151,7 @@ impl<'a> B<'a> {
 }
 
 /// A weight matrix seen by the GPU
+#[derive(Clone)]
 struct GpuWeight {
     buf: Buffer,
     offset: usize,
@@ -167,6 +181,22 @@ fn mv_kernel(ty: GgmlType) -> Option<(&'static str, usize, usize)> {
         GgmlType::F32 => ("mv_f32", 4, 128),
         GgmlType::F16 => ("mv_f16", 4, 128),
         GgmlType::BF16 => ("mv_bf16", 4, 128),
+        _ => return None,
+    })
+}
+
+/// The `mmv` kernels, for 4 to 16 input rows
+fn mmv_kernel(ty: GgmlType) -> Option<&'static str> {
+    Some(match ty {
+        GgmlType::F32 => "mmv_f32",
+        GgmlType::F16 => "mmv_f16",
+        GgmlType::BF16 => "mmv_bf16",
+        GgmlType::Q4_0 => "mmv_q4_0",
+        GgmlType::Q4_1 => "mmv_q4_1",
+        GgmlType::Q8_0 => "mmv_q8_0",
+        GgmlType::Q4K => "mmv_q4_K",
+        GgmlType::Q5K => "mmv_q5_K",
+        GgmlType::Q6K => "mmv_q6_K",
         _ => return None,
     })
 }
@@ -203,6 +233,15 @@ const KERNELS: &[&str] = &[
     "mm_q4_K",
     "mm_q5_K",
     "mm_q6_K",
+    "mmv_f32",
+    "mmv_f16",
+    "mmv_bf16",
+    "mmv_q4_0",
+    "mmv_q4_1",
+    "mmv_q8_0",
+    "mmv_q4_K",
+    "mmv_q5_K",
+    "mmv_q6_K",
     "add_inplace",
     "swiglu",
     "rms_norm",
@@ -265,6 +304,7 @@ pub struct MetalEngine<'m> {
     attn_kernel: String,
     attn_nsg: usize,
     flash_kernel: String,
+    flash_split_kernel: String,
     max_batch: usize,
 }
 
@@ -379,6 +419,7 @@ impl<'m> MetalEngine<'m> {
         };
         let attn_kernel = format!("attn_split_{}_{group}", c.head_dim);
         let flash_kernel = format!("attn_flash_{}", c.head_dim);
+        let flash_split_kernel = format!("attn_flash_split_{}", c.head_dim);
 
         let device = MTLCreateSystemDefaultDevice().ok_or_else(|| backend("metal: no device"))?;
         let library = device
@@ -390,11 +431,11 @@ impl<'m> MetalEngine<'m> {
                 ))
             })?;
         let mut map = HashMap::new();
-        for name in KERNELS
-            .iter()
-            .copied()
-            .chain([attn_kernel.as_str(), flash_kernel.as_str()])
-        {
+        for name in KERNELS.iter().copied().chain([
+            attn_kernel.as_str(),
+            flash_kernel.as_str(),
+            flash_split_kernel.as_str(),
+        ]) {
             let f = library
                 .newFunctionWithName(&NSString::from_str(name))
                 .ok_or_else(|| backend(format!("metal: missing kernel {name}")))?;
@@ -439,6 +480,7 @@ impl<'m> MetalEngine<'m> {
             attn_kernel,
             attn_nsg,
             flash_kernel,
+            flash_split_kernel,
             layers,
             mtp,
             max_batch: max_batch.max(1),
@@ -492,11 +534,23 @@ impl<'m> MetalEngine<'m> {
         Self::args(enc, &args);
         Self::bind(enc, &[B(&w.buf, w.offset), x, out]);
         match mv_kernel(w.ty) {
-            Some((name, rows_per_tg, threads)) if n <= MV_MAX_ROWS => self.dispatch(
+            // the float32 weights are small vectors' projections, too few rows to fill mmv
+            Some((name, rows_per_tg, threads))
+                if n <= MV_MAX_ROWS || (w.ty == GgmlType::F32 && n <= 8) =>
+            {
+                self.dispatch(
+                    enc,
+                    name,
+                    [w.rows.div_ceil(rows_per_tg), n, 1],
+                    [threads, 1, 1],
+                    0,
+                )
+            }
+            _ if n <= MMV_MAX_ROWS => self.dispatch(
                 enc,
-                name,
-                [w.rows.div_ceil(rows_per_tg), n, 1],
-                [threads, 1, 1],
+                mmv_kernel(w.ty).expect("checked at load"),
+                [w.rows.div_ceil(MMV_WEIGHT_ROWS), n.div_ceil(MMV_ROWS), 1],
+                [64, 1, 1],
                 0,
             ),
             _ => {
@@ -566,6 +620,12 @@ impl Engine for MetalEngine<'_> {
 
     fn batch_size(&self) -> usize {
         self.max_batch
+    }
+
+    // a verify pass of 5 tokens costs 1.75x one of 1 (the matmul kernels read
+    // the weights once for 8 tokens); 5 drafts are about as fast, 3 and 6 slower
+    fn draft_size(&self) -> usize {
+        4
     }
 
     fn description(&self) -> String {
@@ -678,6 +738,8 @@ struct MtpState {
     last: Buffer,
     /// normalized output of the last draft, the hidden state of the next
     chain: Buffer,
+    /// the output head rows of the draft vocabulary
+    head: Option<(DraftVocab, Buffer)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -772,6 +834,17 @@ impl<'e> MetalSession<'e> {
                 input: alloc(4 * b * 2 * c.n_embd)?,
                 last: alloc(4 * c.n_embd)?,
                 chain: alloc(4 * c.n_embd)?,
+                head: match DraftVocab::new(c.n_vocab) {
+                    Some(vocab) => {
+                        let out = &e.model.output;
+                        let rb = out.data.len() / out.rows;
+                        let buf = alloc(DRAFT_CAP * rb)?;
+                        let n = vocab.len();
+                        copy_head_rows(out, vocab.tokens(0..n), host_bytes(&buf, 0, n * rb));
+                        Some((vocab, buf))
+                    }
+                    None => None,
+                },
             })
         } else {
             None
@@ -801,6 +874,20 @@ impl<'e> MetalSession<'e> {
     }
 
     fn run(&mut self, tokens: &[TokenId], pass: Pass) -> Vec<Vec<f32>> {
+        if let Some((vocab, buf)) = self.mtp.as_mut().and_then(|m| m.head.as_mut()) {
+            let added = vocab.observe(
+                tokens,
+                if pass == Pass::Verify {
+                    1
+                } else {
+                    tokens.len()
+                },
+            );
+            let out = &self.e.model.output;
+            let rb = out.data.len() / out.rows;
+            let dst = host_bytes(buf, added.start * rb, added.len() * rb);
+            copy_head_rows(out, vocab.tokens(added), dst);
+        }
         let mut out = Vec::new();
         let chunks: Vec<&[TokenId]> = tokens.chunks(self.e.max_batch).collect();
         for (i, chunk) in chunks.iter().enumerate() {
@@ -1083,7 +1170,13 @@ impl<'e> MetalSession<'e> {
                 e.matmul(enc, wk, h, n, B::at(&s.k));
                 e.matmul(enc, wv, h, n, B::at(&s.v));
 
-                let (splits, chunk) = attn_splits(c, pos0, n, e.max_batch);
+                let flash_split =
+                    (2..ATTN_FLASH_MIN).contains(&n) && pos0 + n >= ATTN_FLASH_SPLIT_CTX;
+                let (splits, chunk) = if flash_split {
+                    flash_splits(c, pos0, n, e.max_batch)
+                } else {
+                    attn_splits(c, pos0, n, e.max_batch)
+                };
                 let args = AttnArgs {
                     n_head: c.n_head as i32,
                     n_kv: c.n_head_kv as i32,
@@ -1148,14 +1241,26 @@ impl<'e> MetalSession<'e> {
                             B::at(&s.part_ml),
                         ],
                     );
-                    let shmem = 4 * (2 * e.attn_nsg * group + group * hd);
-                    e.dispatch(
-                        enc,
-                        &e.attn_kernel,
-                        [c.n_head_kv, splits, n],
-                        [32 * e.attn_nsg, 1, 1],
-                        shmem,
-                    );
+                    if flash_split {
+                        let shmem = ATTN_FLASH_R * (2 * hd + 4 * ATTN_FLASH_C + 4);
+                        let blocks = (n * group).div_ceil(ATTN_FLASH_R);
+                        e.dispatch(
+                            enc,
+                            &e.flash_split_kernel,
+                            [blocks, c.n_head_kv, splits],
+                            [32 * ATTN_FLASH_NSG, 1, 1],
+                            shmem,
+                        );
+                    } else {
+                        let shmem = 4 * (2 * e.attn_nsg * group + group * hd);
+                        e.dispatch(
+                            enc,
+                            &e.attn_kernel,
+                            [c.n_head_kv, splits, n],
+                            [32 * e.attn_nsg, 1, 1],
+                            shmem,
+                        );
+                    }
 
                     MetalEngine::args(enc, &args);
                     MetalEngine::bind(
@@ -1203,6 +1308,15 @@ fn attn_splits(c: &Config, pos0: usize, n: usize, max_batch: usize) -> (usize, u
     (splits, n_ctx.div_ceil(splits))
 }
 
+/// Split-K ranges and their length, a multiple of `ATTN_FLASH_C`, for the
+/// split `attn_flash` kernel on `n` tokens after `pos0`
+fn flash_splits(c: &Config, pos0: usize, n: usize, max_batch: usize) -> (usize, usize) {
+    let n_ctx = pos0 + n;
+    let max = (attn_parts(c, max_batch) / (n * c.n_head)).clamp(1, ATTN_MAX_SPLITS);
+    let chunk = n_ctx.div_ceil(max).next_multiple_of(ATTN_FLASH_C);
+    (n_ctx.div_ceil(chunk), chunk)
+}
+
 impl Session for MetalSession<'_> {
     fn forward(&mut self, tokens: &[TokenId]) -> Vec<f32> {
         self.run(tokens, Pass::Forward)
@@ -1214,7 +1328,12 @@ impl Session for MetalSession<'_> {
         self.run(tokens, Pass::Prefill);
     }
 
-    fn draft(&mut self, next: TokenId) -> Vec<TokenId> {
+    fn draft(
+        &mut self,
+        next: TokenId,
+        n: usize,
+        pick: &mut dyn FnMut(&DraftLogits<'_>) -> TokenId,
+    ) -> Vec<TokenId> {
         let (Some(gm), Some(m)) = (&self.e.mtp, &self.mtp) else {
             return Vec::new();
         };
@@ -1228,9 +1347,10 @@ impl Session for MetalSession<'_> {
             "draft must follow a forward pass or keep"
         );
         let base = m.rows;
-        let mut drafts = Vec::with_capacity(self.draft);
+        let n = n.min(self.draft);
+        let mut drafts = Vec::with_capacity(n);
         let mut tok = next;
-        for i in 0..self.draft.min(self.context - base) {
+        for i in 0..n.min(self.context - base) {
             e.model
                 .tok_embd
                 .dequantize_row(tok as usize, host(&m.emb, 0, emb));
@@ -1250,9 +1370,33 @@ impl Session for MetalSession<'_> {
                     1,
                     emb,
                 );
-                e.matmul(enc, &e.output, B::at(&m.chain), 1, B::at(&self.s.logits));
+                let head = match &m.head {
+                    Some((vocab, buf)) if !vocab.full() => Some(GpuWeight {
+                        buf: buf.clone(),
+                        offset: 0,
+                        rows: vocab.len(),
+                        ..e.output.clone()
+                    }),
+                    _ => None,
+                };
+                e.matmul(
+                    enc,
+                    head.as_ref().unwrap_or(&e.output),
+                    B::at(&m.chain),
+                    1,
+                    B::at(&self.s.logits),
+                );
             });
-            tok = argmax(host(&self.s.logits, 0, c.n_vocab));
+            tok = match &m.head {
+                Some((vocab, _)) if !vocab.full() => pick(&DraftLogits {
+                    logits: host(&self.s.logits, 0, vocab.len()),
+                    tokens: Some(vocab.tokens(0..vocab.len())),
+                }),
+                _ => pick(&DraftLogits {
+                    logits: host(&self.s.logits, 0, c.n_vocab),
+                    tokens: None,
+                }),
+            };
             drafts.push(tok);
         }
         if let Some(m) = &mut self.mtp {

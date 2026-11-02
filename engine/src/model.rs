@@ -10,6 +10,7 @@
 //! the proposals through the trunk and [`Model::keep`] drops the rejected ones.
 
 use crate::Error;
+use crate::engine::DraftLogits;
 use crate::gguf::{Gguf, Value};
 #[cfg(not(any(feature = "std", test)))]
 use crate::math::Float;
@@ -17,8 +18,8 @@ use crate::ops::{self, Input, Weight, matmul_new};
 use crate::par::*;
 use crate::prelude::*;
 use crate::quant;
-use crate::sampler::argmax;
 use crate::tokenizer::TokenId;
+use alloc::collections::VecDeque;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -348,10 +349,25 @@ impl<'a> Model<'a> {
             });
         }
         let mtp = if mtp && self.has_mtp() {
+            let head = match DraftVocab::new(c.n_vocab) {
+                Some(vocab) => {
+                    let rb = self.output.data.len() / self.output.rows;
+                    let mut rows = Vec::new();
+                    rows.try_reserve_exact(DRAFT_CAP * rb)
+                        .map_err(|_| Error::OutOfMemory {
+                            bytes: DRAFT_CAP * rb,
+                        })?;
+                    rows.resize(vocab.len() * rb, 0);
+                    copy_head_rows(&self.output, vocab.tokens(0..vocab.len()), &mut rows);
+                    Some((vocab, rows))
+                }
+                None => None,
+            };
             Some(MtpState {
                 kv: kv()?,
                 rows: 0,
                 last: zeroed(c.n_embd)?,
+                head,
             })
         } else {
             None
@@ -379,7 +395,13 @@ impl<'a> Model<'a> {
 
     /// Up to `n` tokens the MTP head predicts after `next`, the token chosen to
     /// follow the sequence. Empty when `state` was made without the head.
-    pub fn draft(&self, state: &mut State, next: TokenId, n: usize) -> Vec<TokenId> {
+    pub fn draft(
+        &self,
+        state: &mut State,
+        next: TokenId,
+        n: usize,
+        pick: &mut dyn FnMut(&DraftLogits<'_>) -> TokenId,
+    ) -> Vec<TokenId> {
         let (Some(mtp), Some(m)) = (&self.mtp, &mut state.mtp) else {
             return Vec::new();
         };
@@ -399,7 +421,20 @@ impl<'a> Model<'a> {
             // overwritten by the next rows entered
             hidden = self.mtp_block(mtp, &mut m.kv, row, 1, base + i);
             ops::rms_norm(&mut hidden, &mtp.head_norm, c.eps);
-            tok = argmax(&matmul_new(&self.output, &Input::new(&hidden, 1)));
+            let x = Input::new(&hidden, 1);
+            tok = match &m.head {
+                Some((vocab, rows)) if !vocab.full() => {
+                    let w = Weight::new(self.output.ty, self.output.cols, vocab.len(), rows);
+                    pick(&DraftLogits {
+                        logits: &matmul_new(&w, &x),
+                        tokens: Some(vocab.tokens(0..vocab.len())),
+                    })
+                }
+                _ => pick(&DraftLogits {
+                    logits: &matmul_new(&self.output, &x),
+                    tokens: None,
+                }),
+            };
             drafts.push(tok);
         }
         m.rows = base + 1;
@@ -448,6 +483,14 @@ impl<'a> Model<'a> {
             "context overflow ({pos0} + {n} > {})",
             state.context
         );
+
+        if let Some((vocab, rows)) = state.mtp.as_mut().and_then(|m| m.head.as_mut()) {
+            let added = vocab.observe(tokens, if pass == Pass::Verify { 1 } else { n });
+            let rb = self.output.data.len() / self.output.rows;
+            rows.resize(vocab.len() * rb, 0);
+            let dst = &mut rows[added.start * rb..];
+            copy_head_rows(&self.output, vocab.tokens(added), dst);
+        }
 
         let mut x = vec![0.0f32; n * e];
         for (t, &tok) in tokens.iter().enumerate() {
@@ -864,6 +907,102 @@ struct MtpState {
     rows: usize,
     /// normalized hidden state of the last token, waiting for its successor
     last: Vec<f32>,
+    /// the output head rows of the draft vocabulary
+    head: Option<(DraftVocab, Vec<u8>)>,
+}
+
+/// Base rows of a draft vocabulary: the lowest token ids. On Qwen3.8 (248k
+/// tokens), 64k rows hold ~90% of the tokens of answers in English, French
+/// and code, and read in a quarter of the time of the whole head; 32k (86%)
+/// and 96k (96%) drafted slower.
+pub(crate) const DRAFT_BASE: usize = 65536;
+/// Rows of a draft vocabulary, at most
+pub(crate) const DRAFT_CAP: usize = DRAFT_BASE + 16384;
+/// Recent tokens a draft vocabulary's coverage is measured over, at most and
+/// at least
+const DRAFT_WINDOW: usize = 128;
+const DRAFT_MIN_WINDOW: usize = 16;
+
+/// The tokens the MTP head drafts from: the output head's rows for the lowest
+/// token ids (BPE merge order, which roughly follows frequency), then for each
+/// other token of the sequence as it comes. Reading these rows takes a few
+/// percent of the time of the whole head, and a token outside them only costs
+/// a rejection, but while too many recent tokens fall outside (another
+/// language than most of the base's, say), drafts use the whole head.
+pub(crate) struct DraftVocab {
+    /// head row -> token
+    ids: Vec<TokenId>,
+    /// token -> whether it has a row
+    has: Vec<bool>,
+    /// whether each recent token had a row when it came, and how many did
+    recent: VecDeque<bool>,
+    hits: usize,
+}
+
+impl DraftVocab {
+    /// None when the vocabulary is small enough to draft from all of it
+    pub(crate) fn new(n_vocab: usize) -> Option<Self> {
+        if n_vocab <= DRAFT_CAP {
+            return None;
+        }
+        let mut has = vec![false; n_vocab];
+        has[..DRAFT_BASE].fill(true);
+        Some(DraftVocab {
+            ids: (0..DRAFT_BASE as TokenId).collect(),
+            has,
+            recent: VecDeque::with_capacity(DRAFT_WINDOW),
+            hits: 0,
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// The tokens of the rows `rows`
+    pub(crate) fn tokens(&self, rows: core::ops::Range<usize>) -> &[TokenId] {
+        &self.ids[rows]
+    }
+
+    /// Whether drafts should use the whole output head: when fewer than 90%
+    /// of the recent tokens had a row
+    pub(crate) fn full(&self) -> bool {
+        self.recent.len() >= DRAFT_MIN_WINDOW && 10 * self.hits < 9 * self.recent.len()
+    }
+
+    /// Give rows to the tokens of a pass that have none, returning the rows
+    /// added. The first `counted` count toward the coverage: the others of a
+    /// verify pass are drafts, which have rows.
+    pub(crate) fn observe(
+        &mut self,
+        tokens: &[TokenId],
+        counted: usize,
+    ) -> core::ops::Range<usize> {
+        let start = self.ids.len();
+        for (i, &t) in tokens.iter().enumerate() {
+            let has = self.has[t as usize];
+            if i < counted {
+                if self.recent.len() == DRAFT_WINDOW && self.recent.pop_front() == Some(true) {
+                    self.hits -= 1;
+                }
+                self.recent.push_back(has);
+                self.hits += has as usize;
+            }
+            if !has && self.ids.len() < DRAFT_CAP {
+                self.has[t as usize] = true;
+                self.ids.push(t);
+            }
+        }
+        start..self.ids.len()
+    }
+}
+
+/// Copy the output head rows of `tokens` to `dst`, one after the other
+pub(crate) fn copy_head_rows(output: &Weight<'_>, tokens: &[TokenId], dst: &mut [u8]) {
+    let rb = output.data.len() / output.rows;
+    for (&t, d) in tokens.iter().zip(dst.chunks_exact_mut(rb)) {
+        d.copy_from_slice(&output.data[t as usize * rb..(t as usize + 1) * rb]);
+    }
 }
 
 /// The last verify pass, until [`Model::keep`]
@@ -887,11 +1026,17 @@ pub struct State {
 
 impl State {
     pub fn kv_bytes(&self) -> usize {
+        let head = self
+            .mtp
+            .as_ref()
+            .and_then(|m| m.head.as_ref())
+            .map_or(0, |(_, rows)| rows.capacity());
         self.layers
             .iter()
             .chain(self.mtp.as_ref().map(|m| &m.kv))
             .map(LayerState::bytes)
-            .sum()
+            .sum::<usize>()
+            + head
     }
 
     /// A copy of the state: the kv caches of the `n_past` tokens, the delta net states

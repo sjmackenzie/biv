@@ -503,6 +503,198 @@ void dequantize_q6_K(device const block_q6_K *xb, short il, thread type4x4 & reg
 }
 
 // ---------------------------------------------------------------------------
+// matmul for up to 8 input rows on simdgroup matrices, the operands placed in
+// the matrix registers directly (no threadgroup memory, no barriers):
+// C[row][token] += W[row][k] Y[token][k], 8 weight rows x 8 tokens per
+// fragment. In an 8x8 fragment lane l holds elements (fm, fn) and (fm, fn + 1)
+// (the layout MLX uses). Over a span of 32 weights of a row, a lane takes
+// elements 8j + fn and 8j + fn + 1 for j = 0..3: `deq_span` gives them, for
+// the span at `s` spans (32 weights) from the row start.
+
+inline void deq_span(device const block_q4_0 * x, int s, short fn, thread float2 * w) {
+    device const block_q4_0 * b = x + s;
+    device const ushort * qs = (device const ushort *) b->qs;
+    const ushort q0 = qs[fn/2], q1 = qs[fn/2 + 4];
+    const float d = b->d, m = -8.f*d;
+    w[0] = float2(d*float(q0 & 0xF) + m,        d*float((q0 >> 8) & 0xF) + m);
+    w[1] = float2(d*float(q1 & 0xF) + m,        d*float((q1 >> 8) & 0xF) + m);
+    w[2] = float2(d*float((q0 >> 4) & 0xF) + m, d*float(q0 >> 12) + m);
+    w[3] = float2(d*float((q1 >> 4) & 0xF) + m, d*float(q1 >> 12) + m);
+}
+
+inline void deq_span(device const block_q4_1 * x, int s, short fn, thread float2 * w) {
+    device const block_q4_1 * b = x + s;
+    device const ushort * qs = (device const ushort *) b->qs;
+    const ushort q0 = qs[fn/2], q1 = qs[fn/2 + 4];
+    const float d = b->d, m = b->m;
+    w[0] = float2(d*float(q0 & 0xF) + m,        d*float((q0 >> 8) & 0xF) + m);
+    w[1] = float2(d*float(q1 & 0xF) + m,        d*float((q1 >> 8) & 0xF) + m);
+    w[2] = float2(d*float((q0 >> 4) & 0xF) + m, d*float(q0 >> 12) + m);
+    w[3] = float2(d*float((q1 >> 4) & 0xF) + m, d*float(q1 >> 12) + m);
+}
+
+inline void deq_span(device const block_q8_0 * x, int s, short fn, thread float2 * w) {
+    device const block_q8_0 * b = x + s;
+    const float d = b->d;
+    FOR_UNROLL (short j = 0; j < 4; j++) {
+        w[j] = d*float2(b->qs[8*j + fn], b->qs[8*j + fn + 1]);
+    }
+}
+
+inline void deq_span(device const block_q4_K * x, int s, short fn, thread float2 * w) {
+    device const block_q4_K * b = x + s/8;
+    const int g = (s%8)/2, h = s%2;
+    const uchar2 sc = get_scale_min_k4_just2(2*g + h, 0, b->scales);
+    const float d = float(b->d)*sc[0], m = float(b->dmin)*sc[1];
+    FOR_UNROLL (short j = 0; j < 4; j++) {
+        const ushort q = *(device const ushort *) (b->qs + 32*g + 8*j + fn) >> (4*h);
+        w[j] = float2(d*float(q & 0xF) - m, d*float((q >> 8) & 0xF) - m);
+    }
+}
+
+inline void deq_span(device const block_q5_K * x, int s, short fn, thread float2 * w) {
+    device const block_q5_K * b = x + s/8;
+    const int g = (s%8)/2, h = s%2;
+    const uchar2 sc = get_scale_min_k4_just2(2*g + h, 0, b->scales);
+    const float d = float(b->d)*sc[0], m = float(b->dmin)*sc[1];
+    FOR_UNROLL (short j = 0; j < 4; j++) {
+        const ushort ql = *(device const ushort *) (b->qs + 32*g + 8*j + fn) >> (4*h);
+        const ushort qh = *(device const ushort *) (b->qh + 8*j + fn) >> (2*g + h);
+        w[j] = float2(d*float((ql & 0xF) | ((qh & 1) << 4)) - m,
+                      d*float(((ql >> 8) & 0xF) | (((qh >> 8) & 1) << 4)) - m);
+    }
+}
+
+inline void deq_span(device const block_q6_K * x, int s, short fn, thread float2 * w) {
+    device const block_q6_K * b = x + s/8;
+    const int n = (s%8)/4, qq = s%4;
+    const float d = b->d;
+    device const int8_t * sc = b->scales + 8*n + 2*qq;
+    const float d0 = d*sc[0], d1 = d*sc[1];
+    FOR_UNROLL (short j = 0; j < 4; j++) {
+        const short l = 8*j + fn;
+        const ushort ql = *(device const ushort *) (b->ql + 64*n + 32*(qq & 1) + l) >> (4*(qq >> 1));
+        const ushort qh = *(device const ushort *) (b->qh + 32*n + l) >> (2*qq);
+        const float dl = j < 2 ? d0 : d1;
+        w[j] = float2(dl*float(int((ql & 0xF) | ((qh & 3) << 4)) - 32),
+                      dl*float(int(((ql >> 8) & 0xF) | (((qh >> 8) & 3) << 4)) - 32));
+    }
+}
+
+inline void deq_span(device const float4x4 * x, int s, short fn, thread float2 * w) {
+    device const float * f = (device const float *) x + 32*s + fn;
+    FOR_UNROLL (short j = 0; j < 4; j++) {
+        w[j] = *(device const float2 *) (f + 8*j);
+    }
+}
+
+inline void deq_span(device const half4x4 * x, int s, short fn, thread float2 * w) {
+    device const half * f = (device const half *) x + 32*s + fn;
+    FOR_UNROLL (short j = 0; j < 4; j++) {
+        w[j] = float2(*(device const half2 *) (f + 8*j));
+    }
+}
+
+inline void deq_span(device const block_bf16 * x, int s, short fn, thread float2 * w) {
+    device const ushort * f = (device const ushort *) x + 32*s + fn;
+    FOR_UNROLL (short j = 0; j < 4; j++) {
+        w[j] = float2(bf16_to_f32(f[8*j]), bf16_to_f32(f[8*j + 1]));
+    }
+}
+
+// RT row fragments and TT input fragments (8 rows each) per simdgroup, U
+// spans per step (loads first)
+template<typename block_q, short RT, short NSG, short U, short TT>
+kernel void mmv(
+        constant MatArgs & args [[buffer(0)]],
+        device const char  * src0 [[buffer(1)]],
+        device const char  * src1 [[buffer(2)]],
+        device       float * dst  [[buffer(3)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const short qid = tiisg/4;
+    const short fm = (qid & 4) + (tiisg/2)%4;
+    const short fn = (qid & 2)*2 + (tiisg%2)*2;
+
+    const int r0 = (tgpig.x*NSG + sgitg)*8*RT;
+    const int r1 = tgpig.y*8*TT;
+    const int nt = min(8*TT, args.n - r1);
+    const int ns = args.k/32;
+
+    device const float * y[TT][2];
+    FOR_UNROLL (short tt = 0; tt < TT; tt++) {
+        FOR_UNROLL (short i = 0; i < 2; i++) {
+            y[tt][i] = (device const float *) (src1 + (r1 + min(8*tt + fn + i, nt - 1))*args.x_row_bytes) + fm;
+        }
+    }
+
+    device const block_q * x[RT];
+    FOR_UNROLL (short rt = 0; rt < RT; rt++) {
+        x[rt] = (device const block_q *) (src0 + min(r0 + 8*rt + fm, args.rows - 1)*args.w_row_bytes);
+    }
+
+    simdgroup_float8x8 c[RT][TT];
+    FOR_UNROLL (short rt = 0; rt < RT; rt++) {
+        FOR_UNROLL (short tt = 0; tt < TT; tt++) {
+            c[rt][tt] = make_filled_simdgroup_matrix<float, 8>(0.f);
+        }
+    }
+
+    for (int is = 0; is < ns; is += U) {
+        float2 w[U][RT][4];
+        FOR_UNROLL (short u = 0; u < U; u++) {
+            FOR_UNROLL (short rt = 0; rt < RT; rt++) {
+                deq_span(x[rt], is + u, fn, w[u][rt]);
+            }
+        }
+        FOR_UNROLL (short u = 0; u < U; u++) {
+            FOR_UNROLL (short tt = 0; tt < TT; tt++) {
+                simdgroup_float8x8 b[4];
+                FOR_UNROLL (short j = 0; j < 4; j++) {
+                    b[j].thread_elements()[0] = y[tt][0][32*(is + u) + 8*j];
+                    b[j].thread_elements()[1] = y[tt][1][32*(is + u) + 8*j];
+                }
+                FOR_UNROLL (short rt = 0; rt < RT; rt++) {
+                    FOR_UNROLL (short j = 0; j < 4; j++) {
+                        simdgroup_float8x8 a;
+                        a.thread_elements()[0] = w[u][rt][j][0];
+                        a.thread_elements()[1] = w[u][rt][j][1];
+                        simdgroup_multiply_accumulate(c[rt][tt], a, b[j], c[rt][tt]);
+                    }
+                }
+            }
+        }
+    }
+
+    FOR_UNROLL (short rt = 0; rt < RT; rt++) {
+        const int row = r0 + 8*rt + fm;
+        FOR_UNROLL (short tt = 0; tt < TT; tt++) {
+            const int t = 8*tt + fn;
+            if (row < args.rows) {
+                if (t < nt)     dst[(r1 + t)*args.rows + row]     = c[rt][tt].thread_elements()[0];
+                if (t + 1 < nt) dst[(r1 + t + 1)*args.rows + row] = c[rt][tt].thread_elements()[1];
+            }
+        }
+    }
+}
+
+// one row fragment, one input fragment and 4 spans per step, 2 simdgroups:
+// the best measured on an M2 Max for every type, from 1 to 8 input rows (two
+// input fragments per simdgroup were no faster over a whole pass of 16)
+#define MMV_T(name, block) \
+template [[host_name(name)]] kernel void mmv<block, 1, 2, 4, 1>(constant MatArgs &, device const char *, device const char *, device float *, uint3, ushort, ushort);
+MMV_T("mmv_f32",  float4x4)
+MMV_T("mmv_f16",  half4x4)
+MMV_T("mmv_bf16", block_bf16)
+MMV_T("mmv_q4_0", block_q4_0)
+MMV_T("mmv_q4_1", block_q4_1)
+MMV_T("mmv_q8_0", block_q8_0)
+MMV_T("mmv_q4_K", block_q4_K)
+MMV_T("mmv_q5_K", block_q5_K)
+MMV_T("mmv_q6_K", block_q6_K)
+
+// ---------------------------------------------------------------------------
 // matmul with simdgroup matrices: 64 weight rows x 32 input rows per
 // threadgroup of 4 simdgroups (ggml kernel_mul_mm, no tensor API).
 // `k` must be a multiple of 32.
@@ -667,6 +859,7 @@ template [[host_name("mm_q8_0")]] kernel mm_t mm<block_q8_0, 2,     dequantize_q
 template [[host_name("mm_q4_K")]] kernel mm_t mm<block_q4_K, QK_NL, dequantize_q4_K>;
 template [[host_name("mm_q5_K")]] kernel mm_t mm<block_q5_K, QK_NL, dequantize_q5_K>;
 template [[host_name("mm_q6_K")]] kernel mm_t mm<block_q6_K, QK_NL, dequantize_q6_K>;
+
 
 // ---------------------------------------------------------------------------
 // element-wise
@@ -1018,17 +1211,21 @@ kernel void attn_reduce(
 // kernel is several times slower.
 // The K / V caches must hold a multiple of C positions: the last range reads
 // past the batch, and those positions are masked.
-template <int HD, int R, int C, int NSG, int QR>
+// SPLIT: the threadgroup takes the range of `chunk` positions tg.z (a multiple
+// of C) and writes split-K partials as attn_split does, for attn_reduce,
+// instead of the output: with few query rows (verify), so that the
+// threadgroups fill the GPU while each K / V tile is read once for the R rows.
+template <int HD, int R, int C, int NSG, int QR, bool SPLIT>
 kernel void attn_flash(
         constant AttnArgs & a [[buffer(0)]],
         device const float * q       [[buffer(1)]],
         device const half  * k_cache [[buffer(2)]],
         device const half  * v_cache [[buffer(3)]],
-        device const float * qg      [[buffer(4)]],
-        device       float * out     [[buffer(5)]],
+        device       float * qg      [[buffer(4)]], // SPLIT: part_o
+        device       float * out     [[buffer(5)]], // SPLIT: part_ml
         threadgroup  half  * shm     [[threadgroup(0)]],
-        uint2  tg   [[threadgroup_position_in_grid]],
-        uint2  ntg  [[threadgroups_per_grid]],
+        uint3  tg   [[threadgroup_position_in_grid]],
+        uint3  ntg  [[threadgroups_per_grid]],
         ushort tid  [[thread_index_in_threadgroup]],
         ushort lane [[thread_index_in_simdgroup]],
         ushort sg   [[simdgroup_index_in_threadgroup]]) {
@@ -1073,7 +1270,9 @@ kernel void attn_flash(
         M[j] = -FLT_MAX/2;
         L[j] = 0.f;
     }
-    const int end = a.pos0 + (min(row0 + R, rows) - 1)/G + 1;
+    const int last_end = a.pos0 + (min(row0 + R, rows) - 1)/G + 1;
+    const int begin = SPLIT ? (int) tg.z*a.chunk : 0;
+    const int end   = SPLIT ? min(begin + a.chunk, last_end) : last_end;
 
     // this simdgroup's score tiles
     const int qr0 = (sg % (RT/QR))*QR;
@@ -1090,7 +1289,7 @@ kernel void attn_flash(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int p0 = 0; p0 < end; p0 += C) {
+    for (int p0 = begin; p0 < end; p0 += C) {
         {
             simdgroup_float8x8 ms[QR][QC];
             FOR_UNROLL (int i = 0; i < QR; i++) {
@@ -1126,7 +1325,7 @@ kernel void attn_flash(
             float m = M[j];
             FOR_UNROLL (int c = 0; c < CL; c++) {
                 const int i = lane + 32*c;
-                s[c] = p0 + i <= last[j] ? ss[r*C + i] : -INFINITY;
+                s[c] = p0 + i <= last[j] && p0 + i < end ? ss[r*C + i] : -INFINITY;
                 m = max(m, s[c]);
             }
             m = simd_max(m);
@@ -1170,6 +1369,35 @@ kernel void attn_flash(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
+    if (SPLIT) {
+        device float * part_o  = qg;
+        device float * part_ml = out;
+        if (lane == 0) {
+            FOR_UNROLL (int j = 0; j < NQ; j++) {
+                const int g = row0 + sg*NQ + j;
+                if (g < rows) {
+                    const int part = ((g/G)*a.n_head + kvh*G + g%G)*a.splits + tg.z;
+                    part_ml[2*part]     = M[j];
+                    part_ml[2*part + 1] = L[j];
+                }
+            }
+        }
+        FOR_UNROLL (int rt = 0; rt < RT; rt++) {
+            const int g = row0 + 8*rt + lr;
+            if (g >= rows) {
+                break;
+            }
+            const int part = ((g/G)*a.n_head + kvh*G + g%G)*a.splits + tg.z;
+            device float * o = part_o + part*HD;
+            FOR_UNROLL (int k = 0; k < OD; k++) {
+                thread auto & e = mo[rt][k].thread_elements();
+                const int i = 8*(sg*OD + k) + lc;
+                o[i]     = e[0];
+                o[i + 1] = e[1];
+            }
+        }
+        return;
+    }
     if (lane == 0) {
         FOR_UNROLL (int j = 0; j < NQ; j++) {
             sf[sg*NQ + j] = 1.f/L[j];
@@ -1197,11 +1425,12 @@ kernel void attn_flash(
 
 // 16 rows, 64 positions, 4 simdgroups of 2 x 2 score tiles: the fastest of the
 // shapes tried on M2 Max for head size 256 (2.4x the split-K kernel)
-#define ATTN_FLASH(hd) \
-template [[host_name("attn_flash_" #hd)]] kernel void attn_flash<hd, 16, 64, 4, 2>( \
+#define ATTN_FLASH(name, hd, split) \
+template [[host_name(name)]] kernel void attn_flash<hd, 16, 64, 4, 2, split>( \
     constant AttnArgs &, device const float *, device const half *, device const half *, \
-    device const float *, device float *, threadgroup half *, uint2, uint2, ushort, ushort, ushort);
-ATTN_FLASH(128) ATTN_FLASH(256)
+    device float *, device float *, threadgroup half *, uint3, uint3, ushort, ushort, ushort);
+ATTN_FLASH("attn_flash_128", 128, false) ATTN_FLASH("attn_flash_256", 256, false)
+ATTN_FLASH("attn_flash_split_128", 128, true) ATTN_FLASH("attn_flash_split_256", 256, true)
 
 // ---------------------------------------------------------------------------
 // gated delta net

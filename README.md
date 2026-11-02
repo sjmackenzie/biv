@@ -41,10 +41,13 @@ hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-Q8_0.gguf   # :Q8_0, 29 GB
 Other quants are files of the same repo (`hf download unsloth/Qwen3.8-27B-GGUF
 --dry-run` lists them); `-m hf.co/unsloth/Qwen3.8-27B-GGUF:<quant>` picks one.
 
-Decoding is speculative by default: the model's MTP head drafts the next token,
-and the trunk checks it in the same pass as the current one (`--draft <n>` sets
-how many tokens are drafted, `0` turns it off). The output is the same as
-without drafting, greedy or sampled.
+Decoding is speculative by default: the model's MTP head drafts the next tokens
+(4 on Metal, 1 on the CPU), and the trunk checks them in the same pass as the
+current one (`--draft <n>` sets how many tokens are drafted, `0` turns it off).
+`--lookup <n>` also proposes up to `n` tokens copied from earlier in the
+conversation when the answer repeats it, which speeds up quoting and editing
+code. The output follows the same distribution as without drafting: greedy, it
+is the same text.
 
 In the chat, `/reset` clears the conversation, `/think` and `/nothink` toggle
 reasoning for the next answers, `/stats` shows context use, Ctrl-C stops an
@@ -151,12 +154,32 @@ its completed rows into that history. A second draft chains on the normalized
 output of the first.
 
 Speculative decoding (`Session::draft` / `verify` / `keep`): the trunk runs the
-sampled token and the drafts in one pass, with logits for each. The drafts are
-greedy, so sampling from the trunk and accepting a draft when it equals the
-sampled token gives the same distribution as decoding without drafts. Rejected
-tokens are dropped by moving `n_past` back for the KV caches; the delta net
-states have one copy per drafted token plus one, the verify pass writes the state
-after each token to the next copy, and `keep` only changes which copy is current.
+sampled token and the drafts in one pass, with logits for each. Greedy, the
+drafts are the MTP head's likeliest tokens, kept while they equal the trunk's.
+Sampling, each draft is drawn from the head's own distribution q (the sampler's
+settings applied to its logits) and kept with a chance of p/q, p being the
+trunk's distribution; otherwise the token is drawn from max(p − q, 0)
+(speculative sampling). Either way the tokens follow p, but more drafts hold
+than with greedy drafts: 4 drafts decode 9% faster. Rejected tokens are dropped
+by moving `n_past` back for the KV caches; the delta net states have one copy
+per drafted token plus one, the verify pass writes the state after each token to
+the next copy, and `keep` only changes which copy is current. Those copies
+(151 MB per token) cost under 1 ms of a 5-token verify: the writes overlap with
+the rest of the pass.
+
+The MTP head drafts over part of the vocabulary: the 65,536 lowest token ids
+(the BPE's earliest merges, about 90% of the tokens of answers in English and
+code) and the
+tokens the sequence has processed, up to 16,384 more, whose rows of the output
+head are copied to a buffer of their own. A draft takes 1.7 ms instead of 4.4.
+When fewer than 90% of the last 128 tokens had a row (Chinese text is mostly
+past the base ids), the head drafts over the whole vocabulary.
+
+Lookup (`ChatOptions::lookup`): the continuation of the latest longest match of
+the last tokens in the conversation (prompt and answers) is proposed instead of
+the MTP head's drafts, if the match has 8 tokens or more, or if it has 3 or more
+and the head drafts the same first 2 tokens. It is cut to 7 tokens unless the
+last two continuations were all right, a copy being under way.
 
 The chat template keeps past reasoning in the history by default, so each turn
 only appends tokens. The KV cache and the recurrent states are kept between turns,
@@ -191,8 +214,10 @@ whose caches are f32).
 - `examples/consistency.rs`: the logits don't depend on how a prompt is split
   into forward passes, so state carry across chunks is exact.
 - `examples/speculative.rs <gguf> [--cpu] [-n tokens] [-d draft]`: greedy
-  answers with and without drafts are the same text, on Metal and on the CPU,
-  with 1 to 3 drafts.
+  answers with and without drafts are the same text, on Metal with 1 to 7
+  drafts and on the CPU. Verify logits differ from those of single-token passes
+  by at most 2e-4 below 2k positions, 7e-4 above (f16 queries in the split
+  flash kernel).
 - `examples/compare.rs <gguf> [repeat]`: Metal vs CPU logits on the same prompt,
   then decode steps. The top-1 token matches at every step. Max logit differences
   are 0.2–0.4 on short prompts and up to a few units in the tail at ~700 tokens
@@ -210,14 +235,17 @@ whose caches are f32).
   file that a simulated build writes after 10 s. The model waits for the build,
   reads what it needs and answers; paths outside the workspace are refused.
 - `examples/attention.rs <gguf> [tokens]`: Metal logits after prefilling the
-  same tokens in full batches (flash attention) and in passes of 8 (split-K)
-  differ no more than between two splits that both use split-K.
+  same tokens in full batches (flash attention) and in passes of 8 (split-K,
+  then split flash attention past 2k positions) have the same top-1 token; over
+  4000 tokens they differ by at most 0.06, and by 0.1–0.3 in the next decode
+  steps.
 
 ## Performance (M2 Max 38-core GPU, Q4_1)
 
 | | biv Metal | llama.cpp Metal | biv CPU (12 threads) | llama.cpp CPU |
 |---|---|---|---|---|
-| decode, 1 draft | 26–27 tok/s greedy, 23 sampled | | ~5.7 tok/s | |
+| decode, 4 drafts | 28 tok/s greedy, 27–28 sampled | | | |
+| decode, 1 draft | 26 tok/s greedy, 26 sampled | | ~5.7 tok/s | |
 | decode, no draft | 18–19 tok/s | 17.6 tok/s | ~5.3 tok/s | 4.5 tok/s |
 | prompt (~20 tok) | 48 tok/s | 36.8 tok/s | ~9–10 tok/s | 5.0 tok/s |
 | prompt (1541 tok) | 149 tok/s | | | |
@@ -226,14 +254,35 @@ BF16 on Metal decodes at about 7.4 tok/s without drafts, which means reading
 about 400 GB/s of weights, close to the memory bandwidth, and 10.6–11.1 tok/s
 with one.
 
-Speculative decoding (`examples/speculative.rs`, greedy, 256 tokens): the MTP
-head's draft is right 86–96% of the time (about 66% sampling at temperature 1).
-On Metal a step is a draft (~5 ms: the MTP layer and the output head) and a
-verify pass of 2 tokens (~1.2× a decode step: the matvec kernels read the weights
-for the second token mostly from cache). Verify passes of 3 and 4 tokens cost
-1.6× and 2×, so 2 or 3 drafts, right 76–92% and 69–85% of the time, are slower
-than one. On the CPU a 2-token pass costs 1.45× a decode step, which leaves a
-small gain.
+The decode rates with drafts are over 8 answers of 300 tokens without thinking
+(4 prompts, 2 seeds; sampled at the model's settings, temperature 1, top-k 20,
+top-p 0.95). Speculative decoding (`examples/speculative.rs`, greedy, 256
+tokens): the MTP head's first draft is right 86–96% of the time (about 66%
+sampling at temperature 1). On Metal a step is the drafts (1.7 ms each) and a
+verify pass, whose cost grows slowly with its tokens (1k positions):
+
+| tokens verified | 1 | 2 | 4 | 5 | 8 | 16 |
+|---|---|---|---|---|---|---|
+| verify pass | 55 ms | 65 ms | 95 ms | 96 ms | 101 ms | 184 ms |
+
+Up to 3 tokens, the matvec kernels run a threadgroup per token and read the
+weights for the others mostly from cache. From 4 to 16, a matmul kernel on
+simdgroup matrices (`mmv`) takes 16 weight rows and 8 tokens per threadgroup,
+dequantizing each weight once for the 8 (before it, a 5-token pass cost 4.7×
+a decode step). 4 drafts are faster than 3 or 6, and as fast as 5. On the CPU a
+2-token pass costs 1.45× a decode step, which leaves a small gain for one draft.
+
+Lookup, on an answer that copies most of a file with a function renamed (4
+drafts, greedy): 46 tok/s without, 73 tok/s with `--lookup 7`, 77 with
+`--lookup 15`. On ordinary answers it rarely fires and changes the rate by less
+than the noise, but each token of a step needs a copy of the delta net states,
+so it is off by default.
+
+Verify passes at 2k positions or more use a split variant of the flash
+attention kernel: its threadgroups take 16 (token, head) rows of a KV head and
+one of up to 64 ranges of positions, so each K/V tile is read once for all the
+tokens of the pass rather than once per token. A 5-token verify at 32k takes
+109 ms instead of 125, an 8-token one 120 ms instead of 145.
 
 Long contexts (`examples/longctx.rs <gguf> [depth...]`, Metal):
 
@@ -266,9 +315,12 @@ arrays went to memory and the kernel was slower than split-K.
   testable under Rosetta, so they need real hardware. AVX-VNNI alone gains
   little: it saves one instruction per 32 products, while the per-block float
   scaling dominates.
-- Matvec kernels that read the weights once for 2–4 tokens, for longer drafts.
-  Looping over the tokens inside a simdgroup (weights in registers) was slower
-  than a threadgroup per token for Q4_1: the per-token activation loads dominate.
+- Draft on the GPU without a round trip per token.
+- A stronger drafter: DFlash2 (a 5-layer model reading 5 of the trunk's layers,
+  drafting a 7-token block in one pass) keeps 3.1–3.3 tokens per step against
+  2.8–2.9 for the MTP head in HyperQwen's measurements, at 1.2 GB read per step
+  once in int4. Or verify trees of drafts (several candidates per position, as
+  in EAGLE), which needs a copy of the delta net states per branch.
 - A 2-row CPU dot kernel, for speculative decoding on the CPU.
 
 ## License

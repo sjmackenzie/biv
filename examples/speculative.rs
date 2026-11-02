@@ -54,7 +54,7 @@ fn main() {
                 thinking: false,
                 max_tokens,
                 context: 4096,
-                draft: d,
+                draft: Some(d),
                 ..Default::default()
             };
             let mut chat = Chat::new(engine, &tok, opts).unwrap();

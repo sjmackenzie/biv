@@ -54,7 +54,7 @@ impl Sampler {
     }
 
     /// xorshift64*, uniform in [0, 1)
-    fn uniform(&mut self) -> f32 {
+    pub fn uniform(&mut self) -> f32 {
         self.rng ^= self.rng >> 12;
         self.rng ^= self.rng << 25;
         self.rng ^= self.rng >> 27;
@@ -62,8 +62,48 @@ impl Sampler {
         (v >> 40) as f32 / (1u64 << 24) as f32
     }
 
+    /// Whether the sampler picks the most likely token
+    pub fn greedy(&self) -> bool {
+        self.cfg.temperature <= 0.0
+    }
+
     /// Pick the next token; `recent` is the generated history used by the penalties
     pub fn sample(&mut self, logits: &mut [f32], recent: &[TokenId]) -> TokenId {
+        self.penalize(logits, recent);
+        if self.greedy() {
+            return argmax(logits);
+        }
+        let cand = self.probs(enumerate(logits));
+        self.draw(&cand)
+    }
+
+    /// The distribution [`Sampler::sample`] draws from, as (token,
+    /// probability) pairs, best first, their sum 1 or a bit less. Not greedy.
+    pub fn distribution(&self, logits: &mut [f32], recent: &[TokenId]) -> Vec<(TokenId, f32)> {
+        self.penalize(logits, recent);
+        self.probs(enumerate(logits))
+    }
+
+    /// The distribution of (token, logit) candidates, as
+    /// [`Sampler::distribution`] without the penalties. Not greedy.
+    pub fn distribution_of(&self, cand: Vec<(TokenId, f32)>) -> Vec<(TokenId, f32)> {
+        self.probs(cand)
+    }
+
+    /// A token of (token, weight) pairs, with a chance proportional to its weight
+    pub fn draw(&mut self, cand: &[(TokenId, f32)]) -> TokenId {
+        let total: f32 = cand.iter().map(|c| c.1).sum();
+        let mut r = self.uniform() * total;
+        for &(t, p) in cand {
+            r -= p;
+            if r <= 0.0 {
+                return t;
+            }
+        }
+        cand.last().unwrap().0
+    }
+
+    fn penalize(&self, logits: &mut [f32], recent: &[TokenId]) {
         let c = &self.cfg;
         if c.presence_penalty != 0.0 || c.repeat_penalty != 1.0 {
             let window = &recent[recent.len().saturating_sub(c.repeat_last_n)..];
@@ -82,17 +122,12 @@ impl Sampler {
                 *l -= c.presence_penalty;
             }
         }
+    }
 
-        if c.temperature <= 0.0 {
-            return argmax(logits);
-        }
-
+    /// top-k, softmax with temperature, min-p, top-p of (token, logit) candidates
+    fn probs(&self, mut cand: Vec<(TokenId, f32)>) -> Vec<(TokenId, f32)> {
+        let c = &self.cfg;
         // candidates, best first
-        let mut cand: Vec<(TokenId, f32)> = logits
-            .iter()
-            .enumerate()
-            .map(|(i, &l)| (i as TokenId, l))
-            .collect();
         let k = if c.top_k > 0 {
             c.top_k.min(cand.len())
         } else {
@@ -131,17 +166,16 @@ impl Sampler {
             }
             cand.truncate(keep);
         }
-
-        let total: f32 = cand.iter().map(|c| c.1).sum();
-        let mut r = self.uniform() * total;
-        for &(t, p) in &cand {
-            r -= p;
-            if r <= 0.0 {
-                return t;
-            }
-        }
-        cand.last().unwrap().0
+        cand
     }
+}
+
+fn enumerate(logits: &[f32]) -> Vec<(TokenId, f32)> {
+    logits
+        .iter()
+        .enumerate()
+        .map(|(i, &l)| (i as TokenId, l))
+        .collect()
 }
 
 pub fn argmax(v: &[f32]) -> TokenId {

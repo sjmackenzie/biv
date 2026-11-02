@@ -1,6 +1,8 @@
-//! Metal prefill attention (`attn_flash`) vs the split-K kernel: logits after
-//! prefilling the same tokens in full batches and in passes of a few tokens,
-//! then a few decode steps. `attention <gguf> [tokens]`
+//! Metal prefill attention (`attn_flash`) vs the kernels of verify and decode
+//! passes: logits after prefilling the same tokens in full batches and in
+//! passes of a few tokens, then a few decode steps. Passes of a few tokens use
+//! the split-K kernel up to 2048 positions and the split `attn_flash` kernel
+//! after, decode steps the split-K kernel. `attention <gguf> [tokens]`
 #[cfg(target_os = "macos")]
 mod imp {
     use std::time::Instant;
@@ -43,7 +45,6 @@ mod imp {
         let t = Instant::now();
         let lf = flash.forward(&ids);
         let tf = t.elapsed();
-        // passes of 8 tokens use the split-K kernel
         let t = Instant::now();
         for c in ids[..n - 1].chunks(8) {
             split.prefill(c);
