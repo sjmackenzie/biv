@@ -1,17 +1,18 @@
 //! GGUF container reader: metadata key/values and tensors, over the bytes of
 //! the file (typically a memory mapping, owned by the [`Gguf`]).
 //!
-//! The metadata is read into the nested structs of [`Metadata`], one level
-//! per component of the dotted keys.
+//! The metadata is read into the nested structs of [`Metadata`], and the
+//! tensor table into those of [`Tensors`], one level per component of the
+//! dotted keys and names.
 //!
 //! Split files (`-00001-of-0000N.gguf`) are parsed together; tensor data of
 //! each shard stays in its own buffer.
 
 mod metadata;
-
-use hashbrown::HashMap;
+mod tensors;
 
 pub use metadata::*;
+pub use tensors::*;
 
 use crate::Error;
 use crate::prelude::*;
@@ -105,7 +106,7 @@ pub struct Gguf {
     /// the keys with no field in [`Metadata`], or a value of another type
     /// than their field's, in file order
     pub extra: Vec<(String, Value)>,
-    pub tensors: HashMap<String, TensorInfo>,
+    pub tensors: Tensors,
     /// tensor names in file order
     pub tensor_order: Vec<String>,
     shards: Vec<Shard>,
@@ -179,7 +180,7 @@ impl Gguf {
         let mut gguf = Gguf {
             metadata: Metadata::default(),
             extra: Vec::new(),
-            tensors: HashMap::new(),
+            tensors: Tensors::default(),
             tensor_order: Vec::new(),
             shards: Vec::new(),
         };
@@ -253,7 +254,7 @@ impl Gguf {
                 return Err(Error::TensorOutOfBounds(info.name));
             }
             self.tensor_order.push(info.name.clone());
-            self.tensors.insert(info.name.clone(), info);
+            self.tensors.insert(info);
         }
         Ok(())
     }
@@ -284,10 +285,12 @@ impl Gguf {
 
     pub fn tensor(&self, name: &str) -> Option<(&TensorInfo, &[u8])> {
         let info = self.tensors.get(name)?;
+        Some((info, self.data(info)))
+    }
+
+    /// The bytes of a tensor of this file
+    pub fn data(&self, info: &TensorInfo) -> &[u8] {
         let start = info.offset as usize;
-        Some((
-            info,
-            &(*self.shards[info.shard]).as_ref()[start..start + info.n_bytes()],
-        ))
+        &(*self.shards[info.shard]).as_ref()[start..start + info.n_bytes()]
     }
 }

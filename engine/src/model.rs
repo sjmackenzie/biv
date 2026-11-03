@@ -11,7 +11,7 @@
 
 use crate::Error;
 use crate::engine::DraftLogits;
-use crate::gguf::{Gguf, need};
+use crate::gguf::{Gguf, TensorInfo, need, tensor};
 #[cfg(not(any(feature = "std", test)))]
 use crate::math::Float;
 use crate::ops::{self, Input, Weight, matmul_new};
@@ -76,11 +76,7 @@ impl Config {
                 "ssm.inner_size != state_size * time_step_rank",
             ));
         }
-        let n_vocab = g
-            .tensors
-            .get("token_embd.weight")
-            .map(|t| t.dims[1] as usize)
-            .ok_or_else(|| Error::MissingTensor("token_embd.weight".into()))?;
+        let n_vocab = tensor!(g.tensors, token_embd.weight)?.dims[1] as usize;
 
         Ok(Config {
             n_layer,
@@ -181,49 +177,48 @@ struct Loader<'g> {
 }
 
 impl<'g> Loader<'g> {
-    fn weight(&self, name: &str, cols: usize, rows: usize) -> Result<Weight<'g>, Error> {
-        let (info, data) = self
-            .g
-            .tensor(name)
-            .ok_or_else(|| Error::MissingTensor(name.into()))?;
+    fn weight(
+        &self,
+        info: Result<&TensorInfo, Error>,
+        cols: usize,
+        rows: usize,
+    ) -> Result<Weight<'g>, Error> {
+        let info = info?;
         let expected = [cols as u64, rows as u64];
         if info.dims != expected {
             return Err(Error::TensorShape {
-                tensor: name.into(),
+                tensor: info.name.clone(),
                 dims: info.dims.clone(),
                 expected: expected.into(),
             });
         }
         if !info.ty.has_dot() {
             return Err(Error::NoKernel {
-                tensor: name.into(),
+                tensor: info.name.clone(),
                 ty: info.ty,
             });
         }
-        Ok(Weight::new(info.ty, cols, rows, data))
+        Ok(Weight::new(info.ty, cols, rows, self.g.data(info)))
     }
 
-    fn vec(&self, name: &str, n: usize) -> Result<Vec<f32>, Error> {
-        let (info, data) = self
-            .g
-            .tensor(name)
-            .ok_or_else(|| Error::MissingTensor(name.into()))?;
+    fn vec(&self, info: Result<&TensorInfo, Error>, n: usize) -> Result<Vec<f32>, Error> {
+        let info = info?;
         if info.n_elements() as usize != n {
             return Err(Error::TensorShape {
-                tensor: name.into(),
+                tensor: info.name.clone(),
                 dims: info.dims.clone(),
                 expected: vec![n as u64],
             });
         }
         let mut out = vec![0.0; n];
-        quant::dequantize_row(info.ty, data, &mut out);
+        quant::dequantize_row(info.ty, self.g.data(info), &mut out);
         Ok(out)
     }
 
     fn layer(&self, cfg: &Config, i: usize, recurrent: bool) -> Result<Layer<'g>, Error> {
         let l = self;
         let (e, hd) = (cfg.n_embd, cfg.head_dim);
-        let n = |s: &str| format!("blk.{i}.{s}");
+        let t = &self.g.tensors;
         let mixer = if recurrent {
             let conv_dim = cfg.conv_dim();
             let d_inner = cfg.d_inner();
@@ -234,33 +229,36 @@ impl<'g> Loader<'g> {
                 ));
             }
             Mixer::DeltaNet(DeltaNet {
-                wqkv: l.weight(&n("attn_qkv.weight"), e, conv_dim)?,
-                wgate: l.weight(&n("attn_gate.weight"), e, d_inner)?,
-                conv1d: l.vec(&n("ssm_conv1d.weight"), cfg.conv_kernel * conv_dim)?,
-                dt_bias: l.vec(&n("ssm_dt.bias"), hv)?,
-                a: l.vec(&n("ssm_a"), hv)?,
-                wbeta: l.weight(&n("ssm_beta.weight"), e, hv)?,
-                walpha: l.weight(&n("ssm_alpha.weight"), e, hv)?,
-                norm: l.vec(&n("ssm_norm.weight"), cfg.ssm_state)?,
-                wout: l.weight(&n("ssm_out.weight"), d_inner, e)?,
+                wqkv: l.weight(tensor!(t, blk[i].attn_qkv.weight), e, conv_dim)?,
+                wgate: l.weight(tensor!(t, blk[i].attn_gate.weight), e, d_inner)?,
+                conv1d: l.vec(
+                    tensor!(t, blk[i].ssm_conv1d.weight),
+                    cfg.conv_kernel * conv_dim,
+                )?,
+                dt_bias: l.vec(tensor!(t, blk[i].ssm_dt.bias), hv)?,
+                a: l.vec(tensor!(t, blk[i].ssm_a), hv)?,
+                wbeta: l.weight(tensor!(t, blk[i].ssm_beta.weight), e, hv)?,
+                walpha: l.weight(tensor!(t, blk[i].ssm_alpha.weight), e, hv)?,
+                norm: l.vec(tensor!(t, blk[i].ssm_norm.weight), cfg.ssm_state)?,
+                wout: l.weight(tensor!(t, blk[i].ssm_out.weight), d_inner, e)?,
             })
         } else {
             Mixer::Attention(Attention {
-                wq: l.weight(&n("attn_q.weight"), e, 2 * hd * cfg.n_head)?,
-                wk: l.weight(&n("attn_k.weight"), e, hd * cfg.n_head_kv)?,
-                wv: l.weight(&n("attn_v.weight"), e, hd * cfg.n_head_kv)?,
-                wo: l.weight(&n("attn_output.weight"), hd * cfg.n_head, e)?,
-                q_norm: l.vec(&n("attn_q_norm.weight"), hd)?,
-                k_norm: l.vec(&n("attn_k_norm.weight"), hd)?,
+                wq: l.weight(tensor!(t, blk[i].attn_q.weight), e, 2 * hd * cfg.n_head)?,
+                wk: l.weight(tensor!(t, blk[i].attn_k.weight), e, hd * cfg.n_head_kv)?,
+                wv: l.weight(tensor!(t, blk[i].attn_v.weight), e, hd * cfg.n_head_kv)?,
+                wo: l.weight(tensor!(t, blk[i].attn_output.weight), hd * cfg.n_head, e)?,
+                q_norm: l.vec(tensor!(t, blk[i].attn_q_norm.weight), hd)?,
+                k_norm: l.vec(tensor!(t, blk[i].attn_k_norm.weight), hd)?,
             })
         };
         Ok(Layer {
-            attn_norm: l.vec(&n("attn_norm.weight"), e)?,
-            post_norm: l.vec(&n("post_attention_norm.weight"), e)?,
+            attn_norm: l.vec(tensor!(t, blk[i].attn_norm.weight), e)?,
+            post_norm: l.vec(tensor!(t, blk[i].post_attention_norm.weight), e)?,
             mixer,
-            ffn_gate: l.weight(&n("ffn_gate.weight"), e, cfg.n_ff)?,
-            ffn_up: l.weight(&n("ffn_up.weight"), e, cfg.n_ff)?,
-            ffn_down: l.weight(&n("ffn_down.weight"), cfg.n_ff, e)?,
+            ffn_gate: l.weight(tensor!(t, blk[i].ffn_gate.weight), e, cfg.n_ff)?,
+            ffn_up: l.weight(tensor!(t, blk[i].ffn_up.weight), e, cfg.n_ff)?,
+            ffn_down: l.weight(tensor!(t, blk[i].ffn_down.weight), cfg.n_ff, e)?,
         })
     }
 }
@@ -271,9 +269,10 @@ impl<'a> Model<'a> {
         let l = Loader { g };
         let e = cfg.n_embd;
 
-        let tok_embd = l.weight("token_embd.weight", e, cfg.n_vocab)?;
-        let output = if g.tensors.contains_key("output.weight") {
-            l.weight("output.weight", e, cfg.n_vocab)?
+        let t = &g.tensors;
+        let tok_embd = l.weight(tensor!(t, token_embd.weight), e, cfg.n_vocab)?;
+        let output = if t.output.weight.is_some() {
+            l.weight(tensor!(t, output.weight), e, cfg.n_vocab)?
         } else {
             tok_embd
         };
@@ -284,14 +283,13 @@ impl<'a> Model<'a> {
 
         // the first next-n block, when the file has one
         let m = cfg.n_layer;
-        let n = |s: &str| format!("blk.{m}.nextn.{s}");
-        let mtp = if g.tensors.contains_key(&n("eh_proj.weight")) {
+        let mtp = if tensor!(t, blk[m].nextn.eh_proj.weight).is_ok() {
             Some(Mtp {
-                enorm: l.vec(&n("enorm.weight"), e)?,
-                hnorm: l.vec(&n("hnorm.weight"), e)?,
-                eh_proj: l.weight(&n("eh_proj.weight"), 2 * e, e)?,
+                enorm: l.vec(tensor!(t, blk[m].nextn.enorm.weight), e)?,
+                hnorm: l.vec(tensor!(t, blk[m].nextn.hnorm.weight), e)?,
+                eh_proj: l.weight(tensor!(t, blk[m].nextn.eh_proj.weight), 2 * e, e)?,
                 layer: l.layer(&cfg, m, false)?,
-                head_norm: l.vec(&n("shared_head_norm.weight"), e)?,
+                head_norm: l.vec(tensor!(t, blk[m].nextn.shared_head_norm.weight), e)?,
             })
         } else {
             None
@@ -302,7 +300,7 @@ impl<'a> Model<'a> {
             .collect();
 
         Ok(Model {
-            output_norm: l.vec("output_norm.weight", e)?,
+            output_norm: l.vec(tensor!(t, output_norm.weight), e)?,
             cfg,
             tok_embd,
             output,
