@@ -3,7 +3,6 @@
 //! through no-copy buffers (unified memory). Small vectors (norms, conv
 //! weights) are uploaded; activations and states live in shared buffers.
 
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
@@ -161,95 +160,128 @@ struct GpuWeight {
     row_bytes: usize,
 }
 
+/// The compute kernels, from `kernels.metal`, each with its MSL name. The
+/// attention kernels are compiled for several head sizes and group sizes:
+/// their variant here is the one of the model's geometry.
+macro_rules! kernels {
+    (|$hd:ident, $group:ident| $($(#[$m:meta])* $v:ident => $name:expr,)*) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Kernel {
+            $($(#[$m])* $v,)*
+        }
+
+        impl Kernel {
+            /// in declaration order: `ALL[k as usize] == k`
+            const ALL: &[Kernel] = &[$(Kernel::$v,)*];
+
+            /// The MSL function, for attention heads of `hd` floats and query
+            /// groups of `group` heads
+            fn name(self, $hd: usize, $group: usize) -> String {
+                let _ = ($hd, $group);
+                match self {
+                    $(Kernel::$v => String::from($name),)*
+                }
+            }
+        }
+    };
+}
+
+kernels! {
+    |hd, group|
+    MvQ4_0 => "mv_q4_0",
+    MvQ4_1 => "mv_q4_1",
+    MvQ5K => "mv_q5_K",
+    MvQ6K => "mv_q6_K",
+    MvF32 => "mv_f32",
+    MvF16 => "mv_f16",
+    MvBf16 => "mv_bf16",
+    MmF32 => "mm_f32",
+    MmF16 => "mm_f16",
+    MmBf16 => "mm_bf16",
+    MmQ4_0 => "mm_q4_0",
+    MmQ4_1 => "mm_q4_1",
+    MmQ8_0 => "mm_q8_0",
+    MmQ4K => "mm_q4_K",
+    MmQ5K => "mm_q5_K",
+    MmQ6K => "mm_q6_K",
+    MmvF32 => "mmv_f32",
+    MmvF16 => "mmv_f16",
+    MmvBf16 => "mmv_bf16",
+    MmvQ4_0 => "mmv_q4_0",
+    MmvQ4_1 => "mmv_q4_1",
+    MmvQ8_0 => "mmv_q8_0",
+    MmvQ4K => "mmv_q4_K",
+    MmvQ5K => "mmv_q5_K",
+    MmvQ6K => "mmv_q6_K",
+    AddInplace => "add_inplace",
+    Swiglu => "swiglu",
+    RmsNorm => "rms_norm",
+    AttnPrep => "attn_prep",
+    AttnReduce => "attn_reduce",
+    /// split-K attention, for short batches
+    AttnSplit => format!("attn_split_{hd}_{group}"),
+    AttnFlash => format!("attn_flash_{hd}"),
+    /// flash attention split along the positions, for long contexts
+    AttnFlashSplit => format!("attn_flash_split_{hd}"),
+    SsmConv => "ssm_conv",
+    Gdn128 => "gdn_128",
+}
+
+/// The pipeline of every [`Kernel`], indexed by it
 struct Kernels {
-    map: HashMap<String, Pipeline>,
+    pipelines: Vec<Pipeline>,
 }
 
 impl Kernels {
-    fn get(&self, name: &str) -> &Pipeline {
-        &self.map[name]
+    fn get(&self, k: Kernel) -> &Pipeline {
+        &self.pipelines[k as usize]
     }
 }
 
-fn mv_kernel(ty: GgmlType) -> Option<(&'static str, usize, usize)> {
+fn mv_kernel(ty: GgmlType) -> Option<(Kernel, usize, usize)> {
     // (kernel, rows per threadgroup, threads per threadgroup)
     Some(match ty {
-        GgmlType::Q4_0 => ("mv_q4_0", 8, 64),
-        GgmlType::Q4_1 => ("mv_q4_1", 8, 64),
-        GgmlType::Q5K => ("mv_q5_K", 2, 64),
-        GgmlType::Q6K => ("mv_q6_K", 4, 64),
-        GgmlType::F32 => ("mv_f32", 4, 128),
-        GgmlType::F16 => ("mv_f16", 4, 128),
-        GgmlType::BF16 => ("mv_bf16", 4, 128),
+        GgmlType::Q4_0 => (Kernel::MvQ4_0, 8, 64),
+        GgmlType::Q4_1 => (Kernel::MvQ4_1, 8, 64),
+        GgmlType::Q5K => (Kernel::MvQ5K, 2, 64),
+        GgmlType::Q6K => (Kernel::MvQ6K, 4, 64),
+        GgmlType::F32 => (Kernel::MvF32, 4, 128),
+        GgmlType::F16 => (Kernel::MvF16, 4, 128),
+        GgmlType::BF16 => (Kernel::MvBf16, 4, 128),
         _ => return None,
     })
 }
 
 /// The `mmv` kernels, for 4 to 16 input rows
-fn mmv_kernel(ty: GgmlType) -> Option<&'static str> {
+fn mmv_kernel(ty: GgmlType) -> Option<Kernel> {
     Some(match ty {
-        GgmlType::F32 => "mmv_f32",
-        GgmlType::F16 => "mmv_f16",
-        GgmlType::BF16 => "mmv_bf16",
-        GgmlType::Q4_0 => "mmv_q4_0",
-        GgmlType::Q4_1 => "mmv_q4_1",
-        GgmlType::Q8_0 => "mmv_q8_0",
-        GgmlType::Q4K => "mmv_q4_K",
-        GgmlType::Q5K => "mmv_q5_K",
-        GgmlType::Q6K => "mmv_q6_K",
+        GgmlType::F32 => Kernel::MmvF32,
+        GgmlType::F16 => Kernel::MmvF16,
+        GgmlType::BF16 => Kernel::MmvBf16,
+        GgmlType::Q4_0 => Kernel::MmvQ4_0,
+        GgmlType::Q4_1 => Kernel::MmvQ4_1,
+        GgmlType::Q8_0 => Kernel::MmvQ8_0,
+        GgmlType::Q4K => Kernel::MmvQ4K,
+        GgmlType::Q5K => Kernel::MmvQ5K,
+        GgmlType::Q6K => Kernel::MmvQ6K,
         _ => return None,
     })
 }
 
-fn mm_kernel(ty: GgmlType) -> Option<&'static str> {
+fn mm_kernel(ty: GgmlType) -> Option<Kernel> {
     Some(match ty {
-        GgmlType::F32 => "mm_f32",
-        GgmlType::F16 => "mm_f16",
-        GgmlType::BF16 => "mm_bf16",
-        GgmlType::Q4_0 => "mm_q4_0",
-        GgmlType::Q4_1 => "mm_q4_1",
-        GgmlType::Q8_0 => "mm_q8_0",
-        GgmlType::Q4K => "mm_q4_K",
-        GgmlType::Q5K => "mm_q5_K",
-        GgmlType::Q6K => "mm_q6_K",
+        GgmlType::F32 => Kernel::MmF32,
+        GgmlType::F16 => Kernel::MmF16,
+        GgmlType::BF16 => Kernel::MmBf16,
+        GgmlType::Q4_0 => Kernel::MmQ4_0,
+        GgmlType::Q4_1 => Kernel::MmQ4_1,
+        GgmlType::Q8_0 => Kernel::MmQ8_0,
+        GgmlType::Q4K => Kernel::MmQ4K,
+        GgmlType::Q5K => Kernel::MmQ5K,
+        GgmlType::Q6K => Kernel::MmQ6K,
         _ => return None,
     })
 }
-
-const KERNELS: &[&str] = &[
-    "mv_q4_0",
-    "mv_q4_1",
-    "mv_q5_K",
-    "mv_q6_K",
-    "mv_f32",
-    "mv_f16",
-    "mv_bf16",
-    "mm_f32",
-    "mm_f16",
-    "mm_bf16",
-    "mm_q4_0",
-    "mm_q4_1",
-    "mm_q8_0",
-    "mm_q4_K",
-    "mm_q5_K",
-    "mm_q6_K",
-    "mmv_f32",
-    "mmv_f16",
-    "mmv_bf16",
-    "mmv_q4_0",
-    "mmv_q4_1",
-    "mmv_q8_0",
-    "mmv_q4_K",
-    "mmv_q5_K",
-    "mmv_q6_K",
-    "add_inplace",
-    "swiglu",
-    "rms_norm",
-    "attn_prep",
-    "attn_reduce",
-    "ssm_conv",
-    "gdn_128",
-];
 
 enum GpuMixer {
     Attention {
@@ -301,10 +333,7 @@ pub struct MetalEngine<'m> {
     output_norm: Buffer,
     output: GpuWeight,
     inv_freq: Buffer,
-    attn_kernel: String,
     attn_nsg: usize,
-    flash_kernel: String,
-    flash_split_kernel: String,
     max_batch: usize,
 }
 
@@ -417,9 +446,6 @@ impl<'m> MetalEngine<'m> {
         }) else {
             return Err(backend("metal: unsupported attention head geometry"));
         };
-        let attn_kernel = format!("attn_split_{}_{group}", c.head_dim);
-        let flash_kernel = format!("attn_flash_{}", c.head_dim);
-        let flash_split_kernel = format!("attn_flash_split_{}", c.head_dim);
 
         let device = MTLCreateSystemDefaultDevice().ok_or_else(|| backend("metal: no device"))?;
         let library = device
@@ -430,14 +456,12 @@ impl<'m> MetalEngine<'m> {
                     e.localizedDescription()
                 ))
             })?;
-        let mut map = HashMap::new();
-        for name in KERNELS.iter().copied().chain([
-            attn_kernel.as_str(),
-            flash_kernel.as_str(),
-            flash_split_kernel.as_str(),
-        ]) {
+        let mut pipelines = Vec::with_capacity(Kernel::ALL.len());
+        for (i, &k) in Kernel::ALL.iter().enumerate() {
+            debug_assert_eq!(k as usize, i);
+            let name = k.name(c.head_dim, group);
             let f = library
-                .newFunctionWithName(&NSString::from_str(name))
+                .newFunctionWithName(&NSString::from_str(&name))
                 .ok_or_else(|| backend(format!("metal: missing kernel {name}")))?;
             let p = device
                 .newComputePipelineStateWithFunction_error(&f)
@@ -447,7 +471,7 @@ impl<'m> MetalEngine<'m> {
                         e.localizedDescription()
                     ))
                 })?;
-            map.insert(name.to_string(), p);
+            pipelines.push(p);
         }
         let queue = device
             .newCommandQueue()
@@ -476,11 +500,8 @@ impl<'m> MetalEngine<'m> {
             model,
             device,
             queue,
-            k: Kernels { map },
-            attn_kernel,
+            k: Kernels { pipelines },
             attn_nsg,
-            flash_kernel,
-            flash_split_kernel,
             layers,
             mtp,
             max_batch: max_batch.max(1),
@@ -494,7 +515,7 @@ impl<'m> MetalEngine<'m> {
     fn dispatch(
         &self,
         enc: &Encoder,
-        kernel: &str,
+        kernel: Kernel,
         grid: [usize; 3],
         threads: [usize; 3],
         shmem: usize,
@@ -603,10 +624,10 @@ impl<'m> MetalEngine<'m> {
         Self::args(enc, &args);
         Self::bind(enc, &[x, B::at(w), out, gate.unwrap_or(x)]);
         let threads = if width >= 1024 { 256 } else { 32 };
-        self.dispatch(enc, "rms_norm", [rows, 1, 1], [threads, 1, 1], 0);
+        self.dispatch(enc, Kernel::RmsNorm, [rows, 1, 1], [threads, 1, 1], 0);
     }
 
-    fn elementwise(&self, enc: &Encoder, kernel: &str, a: B<'_>, b: B<'_>, n: usize) {
+    fn elementwise(&self, enc: &Encoder, kernel: Kernel, a: B<'_>, b: B<'_>, n: usize) {
         Self::args(enc, &EltArgs { n: n as i32 });
         Self::bind(enc, &[a, b]);
         self.dispatch(enc, kernel, [n.div_ceil(256), 1, 1], [256, 1, 1], 0);
@@ -1112,7 +1133,7 @@ impl<'e> MetalSession<'e> {
                 );
                 e.dispatch(
                     enc,
-                    "ssm_conv",
+                    Kernel::SsmConv,
                     [conv_dim.div_ceil(256), 1, 1],
                     [256, 1, 1],
                     0,
@@ -1141,7 +1162,7 @@ impl<'e> MetalSession<'e> {
                         B::at(&s.o),
                     ],
                 );
-                e.dispatch(enc, "gdn_128", [sd / 4, hv, 1], [32, 4, 1], 0);
+                e.dispatch(enc, Kernel::Gdn128, [sd / 4, hv, 1], [32, 4, 1], 0);
 
                 // norm(o) * silu(z), per head, in place
                 e.rms_norm(
@@ -1206,7 +1227,7 @@ impl<'e> MetalSession<'e> {
                 );
                 e.dispatch(
                     enc,
-                    "attn_prep",
+                    Kernel::AttnPrep,
                     [c.n_head + c.n_head_kv, n, 1],
                     [32, 1, 1],
                     0,
@@ -1224,7 +1245,7 @@ impl<'e> MetalSession<'e> {
                     let blocks = (n * group).div_ceil(ATTN_FLASH_R);
                     e.dispatch(
                         enc,
-                        &e.flash_kernel,
+                        Kernel::AttnFlash,
                         [blocks, c.n_head_kv, 1],
                         [32 * ATTN_FLASH_NSG, 1, 1],
                         shmem,
@@ -1246,7 +1267,7 @@ impl<'e> MetalSession<'e> {
                         let blocks = (n * group).div_ceil(ATTN_FLASH_R);
                         e.dispatch(
                             enc,
-                            &e.flash_split_kernel,
+                            Kernel::AttnFlashSplit,
                             [blocks, c.n_head_kv, splits],
                             [32 * ATTN_FLASH_NSG, 1, 1],
                             shmem,
@@ -1255,7 +1276,7 @@ impl<'e> MetalSession<'e> {
                         let shmem = 4 * (2 * e.attn_nsg * group + group * hd);
                         e.dispatch(
                             enc,
-                            &e.attn_kernel,
+                            Kernel::AttnSplit,
                             [c.n_head_kv, splits, n],
                             [32 * e.attn_nsg, 1, 1],
                             shmem,
@@ -1272,21 +1293,21 @@ impl<'e> MetalSession<'e> {
                             B::at(&s.o),
                         ],
                     );
-                    e.dispatch(enc, "attn_reduce", [c.n_head, n, 1], [hd, 1, 1], 0);
+                    e.dispatch(enc, Kernel::AttnReduce, [c.n_head, n, 1], [hd, 1, 1], 0);
                 }
 
                 e.matmul(enc, wo, B::at(&s.o), n, y);
             }
             _ => unreachable!("layer / state kind mismatch"),
         }
-        e.elementwise(enc, "add_inplace", x, y, n * emb);
+        e.elementwise(enc, Kernel::AddInplace, x, y, n * emb);
 
         e.rms_norm(enc, x, &layer.post_norm, h, None, n, emb);
         e.matmul(enc, &layer.ffn_gate, h, n, B::at(&s.a1));
         e.matmul(enc, &layer.ffn_up, h, n, B::at(&s.a2));
-        e.elementwise(enc, "swiglu", B::at(&s.a1), B::at(&s.a2), n * c.n_ff);
+        e.elementwise(enc, Kernel::Swiglu, B::at(&s.a1), B::at(&s.a2), n * c.n_ff);
         e.matmul(enc, &layer.ffn_down, B::at(&s.a1), n, y);
-        e.elementwise(enc, "add_inplace", x, y, n * emb);
+        e.elementwise(enc, Kernel::AddInplace, x, y, n * emb);
     }
 }
 
