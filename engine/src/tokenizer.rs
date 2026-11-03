@@ -29,8 +29,7 @@ pub struct Tokenizer {
     bytes: Vec<Vec<u8>>,
     is_special: Vec<bool>,
     token_to_id: HashMap<String, TokenId>,
-    /// (left, right) -> (rank, merged)
-    merges: HashMap<(TokenId, TokenId), (u32, TokenId)>,
+    merges: Merges,
     /// token id of each raw byte
     byte_tokens: [TokenId; 256],
     /// special tokens, longest first, for splitting text that may contain them
@@ -40,6 +39,70 @@ pub struct Tokenizer {
     /// tokens that end a generation
     pub eog: Vec<TokenId>,
 }
+
+/// One BPE merge of a left token, which [`Merges`] files it under
+#[derive(Clone, Copy)]
+struct Merge {
+    right: TokenId,
+    rank: u32,
+    merged: TokenId,
+}
+
+/// The BPE merges, by left token: those of `l` are at
+/// `offsets[l]..offsets[l + 1]` of the other arrays, sorted by right token.
+/// The right tokens, which the lookups search, are an array of their own.
+struct Merges {
+    offsets: Vec<u32>,
+    rights: Vec<TokenId>,
+    /// rank and merged token
+    merges: Vec<(u32, TokenId)>,
+}
+
+impl Merges {
+    /// From `(left, merge)` in rank order; for a pair listed twice, the
+    /// first (lowest rank) one counts
+    fn new(n_vocab: usize, mut list: Vec<(TokenId, Merge)>) -> Self {
+        list.sort_by_key(|&(l, m)| (l, m.right, m.rank));
+        list.dedup_by_key(|&mut (l, m)| (l, m.right));
+        let mut offsets = vec![0u32; n_vocab + 1];
+        for &(l, _) in &list {
+            offsets[l as usize + 1] += 1;
+        }
+        for i in 0..n_vocab {
+            offsets[i + 1] += offsets[i];
+        }
+        Merges {
+            offsets,
+            rights: list.iter().map(|(_, m)| m.right).collect(),
+            merges: list.iter().map(|(_, m)| (m.rank, m.merged)).collect(),
+        }
+    }
+
+    /// The rank and the merged token of `(l, r)`
+    fn get(&self, l: TokenId, r: TokenId) -> Option<(u32, TokenId)> {
+        let l = l as usize;
+        let start = *self.offsets.get(l)? as usize;
+        let end = self.offsets[l + 1] as usize;
+        let i = self.rights[start..end].binary_search(&r).ok()?;
+        Some(self.merges[start + i])
+    }
+}
+
+/// The buffers of [`Tokenizer::bpe`], reused from one piece to the next
+#[derive(Default)]
+struct Bpe {
+    syms: Vec<TokenId>,
+    /// the merge of each adjacent pair of `syms`: a round looks up only the
+    /// pairs its merges made
+    pairs: Vec<Option<(u32, TokenId)>>,
+    next_syms: Vec<TokenId>,
+    next_pairs: Vec<Option<(u32, TokenId)>>,
+    /// index in `syms` of each symbol of `next_syms` a round left as is
+    kept: Vec<Option<usize>>,
+}
+
+/// The characters [`byte_to_unicode`] maps bytes to are all below this
+const UNICODE_BYTES: usize = 0x144;
 
 /// GPT-2's reversible byte <-> printable unicode mapping
 fn byte_to_unicode() -> [char; 256] {
@@ -77,11 +140,10 @@ impl Tokenizer {
             None => vec![1; tokens.len()],
         };
 
-        let unicode_to_byte: HashMap<char, u8> = byte_to_unicode()
-            .iter()
-            .enumerate()
-            .map(|(b, &c)| (c, b as u8))
-            .collect();
+        let mut unicode_to_byte = [None; UNICODE_BYTES];
+        for (b, &c) in byte_to_unicode().iter().enumerate() {
+            unicode_to_byte[c as usize] = Some(b as u8);
+        }
 
         let is_special: Vec<bool> = types
             .iter()
@@ -95,7 +157,7 @@ impl Tokenizer {
                     t.as_bytes().to_vec()
                 } else {
                     t.chars()
-                        .map(|c| unicode_to_byte.get(&c).copied())
+                        .map(|c| unicode_to_byte.get(c as usize).copied().flatten())
                         .collect::<Option<Vec<u8>>>()
                         .unwrap_or_else(|| t.as_bytes().to_vec())
                 }
@@ -114,7 +176,7 @@ impl Tokenizer {
             byte_tokens[b] = *token_to_id.get(&c).ok_or(Error::MissingToken(c))?;
         }
 
-        let mut merges = HashMap::new();
+        let mut merges = Vec::new();
         for (rank, merge) in need!(m, tokenizer.ggml.merges)?.iter().enumerate() {
             let Some((l, r)) = merge.split_once(' ') else {
                 continue;
@@ -126,8 +188,14 @@ impl Tokenizer {
             ) else {
                 continue;
             };
-            merges.entry((li, ri)).or_insert((rank as u32, mi));
+            let m = Merge {
+                right: ri,
+                rank: rank as u32,
+                merged: mi,
+            };
+            merges.push((li, m));
         }
+        let merges = Merges::new(tokens.len(), merges);
 
         let mut specials: Vec<(String, TokenId)> = tokens
             .iter()
@@ -243,45 +311,52 @@ impl Tokenizer {
     }
 
     fn encode_into(&self, text: &str, out: &mut Vec<TokenId>) {
+        let mut scratch = Bpe::default();
         for piece in pre_split(text) {
-            self.bpe(piece.as_bytes(), out);
+            self.bpe(piece.as_bytes(), &mut scratch, out);
         }
     }
 
-    fn bpe(&self, piece: &[u8], out: &mut Vec<TokenId>) {
-        let mut syms: Vec<TokenId> = piece
-            .iter()
-            .map(|&b| self.byte_tokens[b as usize])
-            .collect();
-        loop {
-            let best = syms
-                .windows(2)
-                .enumerate()
-                .filter_map(|(i, w)| {
-                    self.merges
-                        .get(&(w[0], w[1]))
-                        .map(|&(rank, m)| (rank, i, m))
-                })
-                .min();
-            let Some((rank, _, _)) = best else { break };
-            // merge every occurrence of this pair, left to right
-            let mut merged = Vec::with_capacity(syms.len());
+    fn bpe(&self, piece: &[u8], scratch: &mut Bpe, out: &mut Vec<TokenId>) {
+        let Bpe {
+            syms,
+            pairs,
+            next_syms,
+            next_pairs,
+            kept,
+        } = scratch;
+        syms.clear();
+        syms.extend(piece.iter().map(|&b| self.byte_tokens[b as usize]));
+        pairs.clear();
+        pairs.extend(syms.windows(2).map(|w| self.merges.get(w[0], w[1])));
+        while let Some(rank) = pairs.iter().flatten().map(|&(rank, _)| rank).min() {
+            // merge every occurrence of this pair (one rank per pair), left to right
+            next_syms.clear();
+            kept.clear();
             let mut i = 0;
             while i < syms.len() {
-                if i + 1 < syms.len()
-                    && let Some(&(r, m)) = self.merges.get(&(syms[i], syms[i + 1]))
+                if let Some(&Some((r, m))) = pairs.get(i)
                     && r == rank
                 {
-                    merged.push(m);
+                    next_syms.push(m);
+                    kept.push(None);
                     i += 2;
                 } else {
-                    merged.push(syms[i]);
+                    next_syms.push(syms[i]);
+                    kept.push(Some(i));
                     i += 1;
                 }
             }
-            syms = merged;
+            next_pairs.clear();
+            next_pairs.extend((1..next_syms.len()).map(|j| match (kept[j - 1], kept[j]) {
+                // two symbols left as is were neighbours already
+                (Some(a), Some(_)) => pairs[a],
+                _ => self.merges.get(next_syms[j - 1], next_syms[j]),
+            }));
+            core::mem::swap(syms, next_syms);
+            core::mem::swap(pairs, next_pairs);
         }
-        out.extend(syms);
+        out.extend_from_slice(syms);
     }
 }
 
@@ -436,6 +511,35 @@ impl StreamDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merges_lookup() {
+        let m = |right, rank, merged| Merge {
+            right,
+            rank,
+            merged,
+        };
+        // in rank order, with (1, 2) listed twice
+        let merges = Merges::new(
+            5,
+            vec![
+                (1, m(2, 0, 10)),
+                (3, m(4, 1, 11)),
+                (1, m(0, 2, 12)),
+                (1, m(2, 3, 13)),
+                (4, m(4, 4, 14)),
+            ],
+        );
+        assert_eq!(merges.get(1, 2), Some((0, 10)));
+        assert_eq!(merges.get(1, 0), Some((2, 12)));
+        assert_eq!(merges.get(3, 4), Some((1, 11)));
+        assert_eq!(merges.get(4, 4), Some((4, 14)));
+        assert_eq!(merges.get(1, 1), None);
+        assert_eq!(merges.get(0, 2), None);
+        assert_eq!(merges.get(2, 1), None);
+        // a token past the vocabulary has no merges
+        assert_eq!(merges.get(9, 1), None);
+    }
 
     /// The regex the pre-tokenizer implements, as llama.cpp has it
     const QWEN35_PRE: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
