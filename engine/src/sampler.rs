@@ -101,6 +101,27 @@ impl Sampler {
         Sampler { cfg, rng: seed | 1 }
     }
 
+    /// The random generator's state after the tokens sampled so far, to
+    /// [`Sampler::resume`] from, e.g. with a [`crate::chat::Prefix`] of the
+    /// same point
+    pub fn rng_state(&self) -> u64 {
+        self.rng
+    }
+
+    /// A sampler that goes on from `rng_state`, as [`Sampler::rng_state`]
+    /// gave it: it samples what the sampler that gave it would have sampled.
+    /// Fails with [`Error::ZeroRngState`] on 0, a state the generator never
+    /// holds.
+    pub fn resume(cfg: SamplerConfig, rng_state: u64) -> Result<Self, Error> {
+        if rng_state == 0 {
+            return Err(Error::ZeroRngState);
+        }
+        Ok(Sampler {
+            cfg,
+            rng: rng_state,
+        })
+    }
+
     /// xorshift64*, uniform in [0, 1)
     pub fn uniform(&mut self) -> f32 {
         self.rng ^= self.rng >> 12;
@@ -279,6 +300,47 @@ mod tests {
             presence_penalty: None,
             repeat_penalty: None,
         }
+    }
+
+    /// Tokens sampled before and after the state is taken
+    const BEFORE: usize = 5;
+    const AFTER: usize = 20;
+    const VOCAB: usize = 50;
+
+    /// Logits that leave many candidates, so that the draws decide the tokens
+    fn logits() -> Vec<f32> {
+        (0..VOCAB).map(|i| (i % 7) as f32 * 0.1).collect()
+    }
+
+    fn draws(s: &mut Sampler, n: usize) -> Vec<TokenId> {
+        (0..n).map(|_| s.sample(&mut logits(), &[])).collect()
+    }
+
+    #[test]
+    fn resume_goes_on_from_the_state() {
+        let cfg = SamplerConfig {
+            top_k: 0,
+            top_p: 1.0,
+            seed: SEED,
+            ..SamplerConfig::default()
+        };
+        let mut a = Sampler::new(cfg.clone());
+        draws(&mut a, BEFORE);
+        let mut b = Sampler::resume(cfg.clone(), a.rng_state()).unwrap();
+        assert_eq!(draws(&mut a, AFTER), draws(&mut b, AFTER));
+        // a new sampler with the same seed starts over instead
+        let mut c = Sampler::new(cfg);
+        let mut d = Sampler::new(c.cfg.clone());
+        draws(&mut d, BEFORE);
+        assert_ne!(draws(&mut c, AFTER), draws(&mut d, AFTER));
+    }
+
+    #[test]
+    fn resume_refuses_state_zero() {
+        assert!(matches!(
+            Sampler::resume(SamplerConfig::default(), 0),
+            Err(Error::ZeroRngState)
+        ));
     }
 
     #[test]

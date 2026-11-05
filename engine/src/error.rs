@@ -64,6 +64,8 @@ pub enum Error {
     Snapshot(&'static str),
     /// A sampler seed of 0: the caller names the seed
     ZeroSeed,
+    /// A sampler state of 0, which the random generator never holds
+    ZeroRngState,
     /// The GPU backend failed: no device, shader compilation, ...
     Backend(String),
 }
@@ -110,6 +112,7 @@ impl fmt::Display for Error {
             }
             Error::Snapshot(why) => write!(f, "cannot restore the snapshot: {why}"),
             Error::ZeroSeed => f.write_str("sampler seed 0: name a seed"),
+            Error::ZeroRngState => f.write_str("sampler state 0: not a state of the generator"),
             Error::Backend(msg) => f.write_str(msg),
         }
     }
