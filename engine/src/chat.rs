@@ -170,6 +170,9 @@ pub struct TurnStats {
     pub looked_up_accepted: usize,
     /// the function calls of the answer, as given to [`Event::ToolCall`]
     pub tool_calls: Vec<ToolCall>,
+    /// the tokens sampled for the answer, in order, the end marker included
+    /// when the model wrote it
+    pub tokens: Vec<TokenId>,
 }
 
 /// A conversation up to some point, see [`Chat::save`]
@@ -254,6 +257,12 @@ impl<'m> Chat<'m> {
 
     pub fn state_bytes(&self) -> usize {
         self.session.state_bytes()
+    }
+
+    /// Every token sampled in this conversation, in order: the history the
+    /// sampler penalties look at
+    pub fn generated(&self) -> &[TokenId] {
+        &self.generated
     }
 
     /// Save the conversation so far, to [`Chat::restore`] it in this chat or
@@ -452,6 +461,7 @@ impl<'m> Chat<'m> {
         loop {
             let next = self.choose(&mut logits, &spec, sampler);
             stats.gen_tokens += 1;
+            stats.tokens.push(next);
             self.generated.push(next);
 
             if next == self.im_end || self.tok.eog.contains(&next) {
