@@ -4,6 +4,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{Mutex, PoisonError};
 
 use biv::Error;
 use biv::chat::{Chat, ChatOptions, Event, TurnStats};
@@ -22,6 +23,10 @@ const METAL_BATCH: usize = 256;
 const SEED: u64 = 0x5EED;
 const SYSTEM: &str = "You are a terse assistant. Answer in one sentence.";
 const MESSAGE: &str = "Name three prime numbers above 100.";
+const FOLLOW_UP: &str = "Which of them is the largest?";
+
+/// One test at a time holds the model, whatever the test threads
+static MODEL: Mutex<()> = Mutex::new(());
 
 fn model_path() -> String {
     std::env::var(MODEL_ENV).unwrap_or_else(|_| panic!("{MODEL_ENV} must name a GGUF file"))
@@ -203,6 +208,7 @@ fn send(chat: &mut Chat<'_>) -> (String, TurnStats) {
 #[test]
 #[ignore = "needs a model file"]
 fn chat_from_a_replayed_session() {
+    let _model = MODEL.lock().unwrap_or_else(PoisonError::into_inner);
     let gguf = biv_cli::open_gguf(model_path()).expect("gguf");
     let tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
     let model = Model::load(&gguf).expect("model");
@@ -258,4 +264,71 @@ fn chat_from_a_replayed_session() {
     assert_eq!(text_a, text_b);
     assert_eq!(stats_a.gen_tokens, stats_b.gen_tokens);
     assert_eq!(first.n_past(), second.n_past());
+}
+
+/// One turn with `sampler`
+fn turn(chat: &mut Chat<'_>, text: &str, sampler: &mut Sampler) -> TurnStats {
+    chat.send(text, sampler, |_| {}, || false).expect("turn")
+}
+
+#[test]
+#[ignore = "needs a model file"]
+fn chat_from_a_session_replayed_after_an_answer() {
+    let _model = MODEL.lock().unwrap_or_else(PoisonError::into_inner);
+    let gguf = biv_cli::open_gguf(model_path()).expect("gguf");
+    let tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
+    let model = Model::load(&gguf).expect("model");
+    let engine = engine(&model);
+    let opts = options();
+    let cfg = SamplerConfig {
+        seed: SEED,
+        ..SamplerConfig::default()
+    };
+
+    // one answer, its session calls recorded, then what a rebuild needs
+    let rec = Recording {
+        inner: engine.as_ref(),
+        log: Log::default(),
+    };
+    let mut first = Chat::new(&rec, &tok, opts.clone()).expect("chat");
+    let mut sampler = Sampler::new(cfg.clone());
+    let one = turn(&mut first, MESSAGE, &mut sampler);
+    assert!(!one.tokens.is_empty());
+    let log = rec.log.borrow().clone();
+    let n_past = first.n_past();
+    let pending = first.pending().to_vec();
+    // the end of the answer waits for the next prompt
+    assert!(!pending.is_empty());
+    let generated = first.generated().to_vec();
+    let history = first.history().to_vec();
+    let rng_state = sampler.rng_state();
+
+    // the original chat goes on
+    let two = turn(&mut first, FOLLOW_UP, &mut sampler);
+    assert!(!two.tokens.is_empty());
+
+    // a new session, the same calls, a chat made from it with the same tokens
+    // and sampler state
+    let mut session = new_session(engine.as_ref(), &opts);
+    replay(session.as_mut(), &log);
+    let mut second = Chat::from_session(
+        engine.as_ref(),
+        &tok,
+        opts,
+        session,
+        pending,
+        generated,
+        history,
+    )
+    .expect("chat from session");
+    assert_eq!(second.n_past(), n_past);
+    let mut resumed = Sampler::resume(cfg, rng_state).expect("resume");
+    let again = turn(&mut second, FOLLOW_UP, &mut resumed);
+
+    // the same next answer
+    assert_eq!(again.tokens, two.tokens);
+    assert_eq!(second.generated(), first.generated());
+    assert_eq!(second.history(), first.history());
+    assert_eq!(second.n_past(), first.n_past());
+    assert_eq!(resumed.rng_state(), sampler.rng_state());
 }
