@@ -414,6 +414,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             |ev| {
                 match ev {
                     Event::PromptDone => t1 = Some(Instant::now()),
+                    // the text events show the answer
+                    Event::Token(_) => {}
                     Event::Thinking(t) => {
                         if !in_think {
                             in_think = true;

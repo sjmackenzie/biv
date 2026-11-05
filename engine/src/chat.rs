@@ -110,6 +110,10 @@ impl Default for ChatOptions {
 pub enum Event<'a> {
     /// the prompt is processed, generation starts
     PromptDone,
+    /// a token of the answer, as soon as it is chosen and before its text:
+    /// the ids of [`TurnStats::tokens`], in order, the end marker included
+    /// when the model writes it
+    Token(TokenId),
     Thinking(&'a str),
     Answer(&'a str),
     /// the reasoning block is complete
@@ -601,6 +605,7 @@ impl<'m> Chat<'m> {
             stats.gen_tokens += 1;
             stats.tokens.push(next);
             self.generated.push(next);
+            on_event(Event::Token(next));
 
             if next == self.im_end || self.tok.eog.contains(&next) {
                 if let Some(text) = call.take() {
