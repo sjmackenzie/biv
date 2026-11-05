@@ -69,8 +69,21 @@ fn chat_turns_on_model() {
     let first = send(&mut chat, FIRST, &mut sampler);
     assert_eq!(first.tokens.len(), first.gen_tokens);
     assert_eq!(chat.generated(), &first.tokens[..]);
+    let prefix = chat.save().expect("save");
+    let rng_state = sampler.rng_state();
     let second = send(&mut chat, SECOND, &mut sampler);
     assert_eq!(second.tokens.len(), second.gen_tokens);
     let both: Vec<_> = first.tokens.iter().chain(&second.tokens).copied().collect();
     assert_eq!(chat.generated(), &both[..]);
+
+    // another chat, from the saved conversation and the sampler state,
+    // gives the same second answer
+    let mut other = Chat::new(engine.as_ref(), &tok, options()).expect("chat");
+    other.restore(&prefix).expect("restore");
+    assert_eq!(other.generated(), &first.tokens[..]);
+    let mut resumed = Sampler::resume(cfg, rng_state).expect("resume");
+    let again = send(&mut other, SECOND, &mut resumed);
+    assert_eq!(again.tokens, second.tokens);
+    assert_eq!(other.generated(), &both[..]);
+    assert_eq!(resumed.rng_state(), sampler.rng_state());
 }
