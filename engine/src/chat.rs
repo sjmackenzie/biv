@@ -331,6 +331,12 @@ impl<'m> Chat<'m> {
         &self.history
     }
 
+    /// The tokens generated but not yet processed, fed before the next
+    /// prompt: the end of the last answer, which the session doesn't hold yet
+    pub fn pending(&self) -> &[TokenId] {
+        &self.pending
+    }
+
     /// Save the conversation so far, to [`Chat::restore`] it in this chat or
     /// another on the same engine. Before the first message, the system prompt
     /// is processed now, so that the prefix holds it.
