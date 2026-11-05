@@ -2,7 +2,7 @@
 //! `BIV_TEST_MODEL=<gguf> cargo test --release --test chat_model -- --ignored`
 //! On macOS they run on Metal, elsewhere on the CPU.
 
-use biv::chat::{Chat, ChatOptions, TurnStats};
+use biv::chat::{Chat, ChatOptions, Event, TurnStats};
 use biv::engine::Engine;
 use biv::model::Model;
 use biv::sampler::{Sampler, SamplerConfig, SamplerOverrides};
@@ -41,8 +41,23 @@ fn options() -> ChatOptions {
     }
 }
 
+/// One turn; the token events must give the tokens of the stats, in order
 fn send(chat: &mut Chat<'_>, text: &str, sampler: &mut Sampler) -> TurnStats {
-    chat.send(text, sampler, |_| {}, || false).expect("turn")
+    let mut streamed = Vec::new();
+    let stats = chat
+        .send(
+            text,
+            sampler,
+            |ev| {
+                if let Event::Token(t) = ev {
+                    streamed.push(t);
+                }
+            },
+            || false,
+        )
+        .expect("turn");
+    assert_eq!(streamed, stats.tokens);
+    stats
 }
 
 #[test]
