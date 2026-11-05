@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use biv::chat::{Chat, ChatOptions, Event, ReasoningEffort, TurnStats};
+use biv::chat::{Chat, ChatOptions, Event, ReasoningEffort, Stop, TurnStats};
 use biv::engine::Engine;
 use biv::gguf::Gguf;
 use biv::model::Model;
@@ -176,7 +176,11 @@ fn print_stats(s: &TurnStats, prompt_time: Duration, gen_time: Duration, style: 
         } else {
             String::new()
         },
-        if s.truncated { " | truncated" } else { "" },
+        if s.stop == Stop::End {
+            ""
+        } else {
+            " | truncated"
+        },
         style.reset()
     );
 }

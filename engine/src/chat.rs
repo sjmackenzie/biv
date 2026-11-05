@@ -159,12 +159,25 @@ impl ToolCall {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+/// Why a turn ended
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// the model wrote its end marker
+    End,
+    /// the answer reached `max_tokens`
+    MaxTokens,
+    /// the session reached the end of the context
+    ContextFull,
+    /// the `stop` function of the caller asked for the end
+    Cancel,
+}
+
+#[derive(Debug, Clone)]
 pub struct TurnStats {
     pub prompt_tokens: usize,
     pub gen_tokens: usize,
-    /// stopped by max_tokens or the context size rather than by the model
-    pub truncated: bool,
+    /// why the turn ended
+    pub stop: Stop,
     /// tokens drafted by the MTP head or proposed from the conversation, and
     /// how many of them were right
     pub drafted: usize,
@@ -498,7 +511,15 @@ impl<'m> Chat<'m> {
 
         let mut stats = TurnStats {
             prompt_tokens: prompt.len(),
-            ..Default::default()
+            gen_tokens: 0,
+            // the loop below sets the reason at each of its two ends
+            stop: Stop::End,
+            drafted: 0,
+            accepted: 0,
+            looked_up: 0,
+            looked_up_accepted: 0,
+            tool_calls: Vec::new(),
+            tokens: Vec::new(),
         };
         self.history.extend_from_slice(&prompt);
         let (body, last) = prompt.split_at(prompt.len() - 1);
@@ -576,8 +597,18 @@ impl<'m> Chat<'m> {
             }
 
             let full = self.session.n_past() - spec.drafts.len() + 2 >= self.opts.context;
-            if stats.gen_tokens >= self.opts.max_tokens || full || stop() {
-                stats.truncated = true;
+            // the first reason that holds names the end, in this order
+            let reason = if stats.gen_tokens >= self.opts.max_tokens {
+                Some(Stop::MaxTokens)
+            } else if full {
+                Some(Stop::ContextFull)
+            } else if stop() {
+                Some(Stop::Cancel)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                stats.stop = reason;
                 // close the message so the history stays well-formed
                 self.pending.push(next);
                 if thinking {
