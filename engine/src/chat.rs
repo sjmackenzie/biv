@@ -233,15 +233,56 @@ impl<'m> Chat<'m> {
         tok: &'m Tokenizer,
         opts: ChatOptions,
     ) -> Result<Self, Error> {
+        let session = engine.new_session(opts.context, session_draft(engine, &opts))?;
+        Self::from_session(
+            engine,
+            tok,
+            opts,
+            session,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    /// A chat that goes on from `session`, a session of `engine` made as
+    /// [`Chat::new`] makes one (`opts.context`, and the draft size of `opts`
+    /// or of the engine, at least `opts.lookup`), for example one rebuilt by
+    /// repeating the session calls of another chat, or one whose calls are
+    /// recorded. `pending` are the tokens generated but not yet processed,
+    /// fed before the next prompt, `generated` every token generated so far,
+    /// for the sampler penalties, and `history` every token of the
+    /// conversation, for prompt lookup; all empty for a session that holds
+    /// nothing.
+    /// A session that holds tokens gets no system block: its system prompt,
+    /// reasoning instructions and tools are those it holds, whatever `opts`
+    /// says, as for [`Chat::restore`]. Fails with [`Error::ContextFull`] when
+    /// the session and `pending` hold more tokens than `opts.context`.
+    pub fn from_session(
+        engine: &'m dyn Engine,
+        tok: &'m Tokenizer,
+        opts: ChatOptions,
+        session: Box<dyn Session + 'm>,
+        pending: Vec<TokenId>,
+        generated: Vec<TokenId>,
+        history: Vec<TokenId>,
+    ) -> Result<Self, Error> {
+        if session.n_past() + pending.len() > opts.context {
+            return Err(Error::ContextFull {
+                n_past: session.n_past(),
+                prompt: pending.len(),
+                context: opts.context,
+            });
+        }
         let id = |s: &str| tok.token_id(s).ok_or_else(|| Error::MissingToken(s.into()));
         Ok(Chat {
             engine,
             tok,
-            session: engine.new_session(opts.context, session_draft(engine, &opts))?,
+            session,
             opts,
-            pending: Vec::new(),
-            generated: Vec::new(),
-            history: Vec::new(),
+            pending,
+            generated,
+            history,
             lookup_run: 0,
             im_end: id("<|im_end|>")?,
             think_end: id("</think>")?,
@@ -282,6 +323,12 @@ impl<'m> Chat<'m> {
     /// sampler penalties look at
     pub fn generated(&self) -> &[TokenId] {
         &self.generated
+    }
+
+    /// Every token of the conversation, prompts and answers, in order: the
+    /// text that prompt lookup searches
+    pub fn history(&self) -> &[TokenId] {
+        &self.history
     }
 
     /// Save the conversation so far, to [`Chat::restore`] it in this chat or
