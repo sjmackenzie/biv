@@ -62,6 +62,8 @@ pub enum Error {
     },
     /// A snapshot that can't be restored in this session
     Snapshot(&'static str),
+    /// A sampler seed of 0: the caller names the seed
+    ZeroSeed,
     /// The GPU backend failed: no device, shader compilation, ...
     Backend(String),
 }
@@ -107,6 +109,7 @@ impl fmt::Display for Error {
                 write!(f, "context full ({n_past} + {prompt} tokens > {context})")
             }
             Error::Snapshot(why) => write!(f, "cannot restore the snapshot: {why}"),
+            Error::ZeroSeed => f.write_str("sampler seed 0: name a seed"),
             Error::Backend(msg) => f.write_str(msg),
         }
     }

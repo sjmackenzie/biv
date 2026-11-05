@@ -5,7 +5,7 @@
 use biv::chat::{Chat, ChatOptions, TurnStats};
 use biv::engine::Engine;
 use biv::model::Model;
-use biv::sampler::{Sampler, SamplerConfig};
+use biv::sampler::{Sampler, SamplerConfig, SamplerOverrides};
 use biv::tokenizer::Tokenizer;
 
 /// The variable that names the GGUF file
@@ -52,10 +52,16 @@ fn chat_turns_on_model() {
     let tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
     let model = Model::load(&gguf).expect("model");
     let engine = engine(&model);
-    let cfg = SamplerConfig {
-        seed: SEED,
-        ..SamplerConfig::default()
+    // the publisher's values: sampled, not greedy, so the seed matters
+    let none = SamplerOverrides {
+        temperature: None,
+        top_k: None,
+        top_p: None,
+        min_p: None,
+        presence_penalty: None,
+        repeat_penalty: None,
     };
+    let cfg = SamplerConfig::from_gguf(&gguf, none, SEED).expect("sampler config");
 
     // the tokens of each answer, and the chat's history of them
     let mut chat = Chat::new(engine.as_ref(), &tok, options()).expect("chat");
