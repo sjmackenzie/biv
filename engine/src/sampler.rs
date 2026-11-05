@@ -1,9 +1,13 @@
 //! Token sampling: penalties, temperature, top-k, top-p, min-p.
 
+use crate::Error;
+use crate::gguf::Gguf;
 #[cfg(not(any(feature = "std", test)))]
 use crate::math::Float;
 use crate::prelude::*;
 use crate::tokenizer::TokenId;
+
+/// The sampling values a model's publisher can store in the GGUF
 
 #[derive(Debug, Clone)]
 pub struct SamplerConfig {
@@ -35,6 +39,50 @@ impl Default for SamplerConfig {
             repeat_last_n: 64,
             seed: 0,
         }
+    }
+}
+
+/// Values that replace those of [`SamplerConfig::from_gguf`]; `None` keeps
+/// the GGUF's value, or the [`SamplerConfig::default`] one for a value the
+/// GGUF doesn't store
+#[derive(Debug, Clone)]
+pub struct SamplerOverrides {
+    pub temperature: Option<f32>,
+    pub top_k: Option<usize>,
+    pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+}
+
+impl SamplerConfig {
+    /// The sampling values recommended by the model's publisher, from the
+    /// GGUF, with `overrides` over them. Fails with [`Error::ZeroSeed`] when
+    /// `seed` is 0: the caller names the seed, so that a run can be repeated.
+    pub fn from_gguf(gguf: &Gguf, overrides: SamplerOverrides, seed: u64) -> Result<Self, Error> {
+        if seed == 0 {
+            return Err(Error::ZeroSeed);
+        }
+        let stored = &gguf.metadata.general.sampling;
+        let defaults = SamplerConfig::default();
+        Ok(SamplerConfig {
+            temperature: overrides
+                .temperature
+                .or(stored.temp)
+                .unwrap_or(defaults.temperature),
+            top_k: overrides
+                .top_k
+                .or(stored.top_k.map(|v| v as usize))
+                .unwrap_or(defaults.top_k),
+            top_p: overrides.top_p.or(stored.top_p).unwrap_or(defaults.top_p),
+            min_p: overrides.min_p.or(stored.min_p).unwrap_or(defaults.min_p),
+            presence_penalty: overrides
+                .presence_penalty
+                .unwrap_or(defaults.presence_penalty),
+            repeat_penalty: overrides.repeat_penalty.unwrap_or(defaults.repeat_penalty),
+            seed,
+            ..defaults
+        })
     }
 }
 
@@ -184,4 +232,95 @@ pub fn argmax(v: &[f32]) -> TokenId {
         .max_by(|a, b| a.1.total_cmp(b.1))
         .map(|(i, _)| i as TokenId)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gguf::Shard;
+
+    const SEED: u64 = 7;
+    const KEY_TEMPERATURE: &str = "general.sampling.temp";
+    const KEY_TOP_K: &str = "general.sampling.top_k";
+    const KEY_TOP_P: &str = "general.sampling.top_p";
+    /// GGUF metadata value types
+    const TYPE_U32: u32 = 4;
+    const TYPE_F32: u32 = 6;
+    const GGUF_MAGIC: &[u8] = b"GGUF";
+    const GGUF_VERSION: u32 = 3;
+
+    fn string(out: &mut Vec<u8>, s: &str) {
+        out.extend((s.len() as u64).to_le_bytes());
+        out.extend(s.as_bytes());
+    }
+
+    /// A GGUF with no tensors and the metadata `kv`, as (key, type, little-endian value)
+    fn gguf(kv: &[(&str, u32, [u8; 4])]) -> Gguf {
+        let mut b = Vec::new();
+        b.extend(GGUF_MAGIC);
+        b.extend(GGUF_VERSION.to_le_bytes());
+        b.extend(0u64.to_le_bytes());
+        b.extend((kv.len() as u64).to_le_bytes());
+        for (key, ty, value) in kv {
+            string(&mut b, key);
+            b.extend(ty.to_le_bytes());
+            b.extend(value);
+        }
+        let shard: Shard = Box::new(b);
+        Gguf::from_shards(vec![shard]).unwrap()
+    }
+
+    fn no_overrides() -> SamplerOverrides {
+        SamplerOverrides {
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            presence_penalty: None,
+            repeat_penalty: None,
+        }
+    }
+
+    #[test]
+    fn from_gguf_refuses_seed_zero() {
+        let g = gguf(&[]);
+        assert!(matches!(
+            SamplerConfig::from_gguf(&g, no_overrides(), 0),
+            Err(Error::ZeroSeed)
+        ));
+    }
+
+    #[test]
+    fn from_gguf_takes_stored_values_then_overrides() {
+        let g = gguf(&[
+            (KEY_TEMPERATURE, TYPE_F32, 0.6f32.to_le_bytes()),
+            (KEY_TOP_K, TYPE_U32, 40u32.to_le_bytes()),
+            (KEY_TOP_P, TYPE_F32, 0.8f32.to_le_bytes()),
+        ]);
+        let c = SamplerConfig::from_gguf(&g, no_overrides(), SEED).unwrap();
+        assert_eq!((c.temperature, c.top_k, c.top_p), (0.6, 40, 0.8));
+        assert_eq!(c.seed, SEED);
+
+        let over = SamplerOverrides {
+            temperature: Some(0.0),
+            top_k: Some(5),
+            min_p: Some(0.1),
+            ..no_overrides()
+        };
+        let c = SamplerConfig::from_gguf(&g, over, SEED).unwrap();
+        assert_eq!(
+            (c.temperature, c.top_k, c.top_p, c.min_p),
+            (0.0, 5, 0.8, 0.1)
+        );
+    }
+
+    #[test]
+    fn from_gguf_without_stored_values_keeps_the_defaults() {
+        let c = SamplerConfig::from_gguf(&gguf(&[]), no_overrides(), SEED).unwrap();
+        let d = SamplerConfig::default();
+        assert_eq!(
+            (c.temperature, c.top_k, c.top_p, c.min_p, c.repeat_last_n),
+            (d.temperature, d.top_k, d.top_p, d.min_p, d.repeat_last_n)
+        );
+    }
 }

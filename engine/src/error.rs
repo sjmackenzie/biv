@@ -64,6 +64,8 @@ pub enum Error {
     Snapshot(&'static str),
     /// A transcript that can't be read, or restored in this chat
     Transcript(&'static str),
+    /// A sampler seed of 0: the caller names the seed
+    ZeroSeed,
     /// The GPU backend failed: no device, shader compilation, ...
     Backend(String),
 }
@@ -113,6 +115,7 @@ impl fmt::Display for Error {
             }
             Error::Snapshot(why) => write!(f, "cannot restore the snapshot: {why}"),
             Error::Transcript(why) => write!(f, "invalid transcript: {why}"),
+            Error::ZeroSeed => f.write_str("sampler seed 0: name a seed"),
             Error::Backend(msg) => f.write_str(msg),
         }
     }
