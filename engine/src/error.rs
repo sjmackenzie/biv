@@ -38,7 +38,7 @@ pub enum Error {
         tensor: String,
         ty: GgmlType,
     },
-    /// `general.architecture` is not `qwen35`
+    /// `general.architecture` is not `qwen35` or `qwen35moe`
     UnsupportedArchitecture(String),
     /// The tokenizer is not GPT-2 style BPE with the `qwen35` pre-tokenizer
     UnsupportedTokenizer {
@@ -88,7 +88,10 @@ impl fmt::Display for Error {
             }
             Error::NoKernel { tensor, ty } => write!(f, "{tensor}: no matmul kernel for {ty:?}"),
             Error::UnsupportedArchitecture(arch) => {
-                write!(f, "unsupported architecture {arch} (expected qwen35)")
+                write!(
+                    f,
+                    "unsupported architecture {arch} (expected qwen35 or qwen35moe)"
+                )
             }
             Error::UnsupportedTokenizer { model, pre } => {
                 write!(

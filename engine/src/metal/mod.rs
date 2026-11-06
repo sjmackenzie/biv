@@ -18,7 +18,9 @@ use objc2_metal::{
 use crate::Error;
 use crate::engine::{DraftLogits, Engine, Session, Snapshot};
 use crate::memory::{DeviceMemory, ModelMemory, SessionMemory, Shape};
-use crate::model::{Config, DRAFT_CAP, DraftVocab, Layer, Mixer, Model, copy_head_rows};
+use crate::model::{
+    Config, DRAFT_CAP, DraftVocab, Experts, Ffn, Layer, Mixer, Model, copy_head_rows,
+};
 use crate::ops::Weight;
 use crate::prelude::*;
 use crate::quant::GgmlType;
@@ -50,6 +52,12 @@ const MMV_MAX_ROWS: usize = 16;
 /// Input rows and weight rows (2 simdgroups of 8) per `mmv` threadgroup
 const MMV_ROWS: usize = 8;
 const MMV_WEIGHT_ROWS: usize = 16;
+/// The pairs of an expert are multiplied by `mm_id` in tiles of 32, the last
+/// one too when it has this many pairs or more; the others by `mmv_id` in
+/// tiles of 8. On an M2 Max, prefill of Qwen3.6 35B-A3B in passes of 256
+/// tokens: 902 tok/s from 33 (no partial tile of 32), 937 from 12 to 16,
+/// 931 from 8.
+const MM_ID_MIN: usize = 16;
 
 /// Attention positions per split-K range, at least
 const ATTN_CHUNK: usize = 32;
@@ -85,6 +93,38 @@ struct MatArgs {
     pad: i32,
     w_row_bytes: u64,
     x_row_bytes: u64,
+}
+
+#[repr(C)]
+struct MatIdArgs {
+    k: i32,
+    rows: i32,
+    x_div: i32,
+    pad: i32,
+    w_row_bytes: u64,
+    x_row_bytes: u64,
+    stride: u64,
+}
+
+#[repr(C)]
+struct RouteArgs {
+    n_expert: i32,
+    k: i32,
+}
+
+#[repr(C)]
+struct SortArgs {
+    n_pairs: i32,
+    n_expert: i32,
+    mm_min: i32,
+    mv_base: i32,
+}
+
+#[repr(C)]
+struct CombineArgs {
+    n_embd: i32,
+    k: i32,
+    shared: i32,
 }
 
 #[repr(C)]
@@ -161,6 +201,18 @@ struct GpuWeight {
     row_bytes: usize,
 }
 
+/// The experts' matrices of a layer seen by the GPU: expert `e`'s is
+/// `stride` bytes after expert 0's, at `offset` in `buf`
+struct GpuExperts {
+    buf: Buffer,
+    offset: usize,
+    ty: GgmlType,
+    cols: usize,
+    rows: usize,
+    row_bytes: usize,
+    stride: usize,
+}
+
 /// The compute kernels, from `kernels.metal`, each with its MSL name. The
 /// attention kernels are compiled for several head sizes and group sizes:
 /// their variant here is the one of the model's geometry.
@@ -226,6 +278,27 @@ kernels! {
     AttnFlashSplit => format!("attn_flash_split_{hd}"),
     SsmConv => "ssm_conv",
     Gdn128 => "gdn_128",
+    MmvIdF32 => "mmv_id_f32",
+    MmvIdF16 => "mmv_id_f16",
+    MmvIdBf16 => "mmv_id_bf16",
+    MmvIdQ4_0 => "mmv_id_q4_0",
+    MmvIdQ4_1 => "mmv_id_q4_1",
+    MmvIdQ8_0 => "mmv_id_q8_0",
+    MmvIdQ4K => "mmv_id_q4_K",
+    MmvIdQ5K => "mmv_id_q5_K",
+    MmvIdQ6K => "mmv_id_q6_K",
+    MmIdF32 => "mm_id_f32",
+    MmIdF16 => "mm_id_f16",
+    MmIdBf16 => "mm_id_bf16",
+    MmIdQ4_0 => "mm_id_q4_0",
+    MmIdQ4_1 => "mm_id_q4_1",
+    MmIdQ8_0 => "mm_id_q8_0",
+    MmIdQ4K => "mm_id_q4_K",
+    MmIdQ5K => "mm_id_q5_K",
+    MmIdQ6K => "mm_id_q6_K",
+    MoeRoute => "moe_route",
+    MoeSort => "moe_sort",
+    MoeCombine => "moe_combine",
 }
 
 /// The pipeline of every [`Kernel`], indexed by it
@@ -269,6 +342,39 @@ fn mmv_kernel(ty: GgmlType) -> Option<Kernel> {
     })
 }
 
+/// The `mmv_id` kernels, for the tiles of the experts' pairs
+fn mmv_id_kernel(ty: GgmlType) -> Option<Kernel> {
+    Some(match ty {
+        GgmlType::F32 => Kernel::MmvIdF32,
+        GgmlType::F16 => Kernel::MmvIdF16,
+        GgmlType::BF16 => Kernel::MmvIdBf16,
+        GgmlType::Q4_0 => Kernel::MmvIdQ4_0,
+        GgmlType::Q4_1 => Kernel::MmvIdQ4_1,
+        GgmlType::Q8_0 => Kernel::MmvIdQ8_0,
+        GgmlType::Q4K => Kernel::MmvIdQ4K,
+        GgmlType::Q5K => Kernel::MmvIdQ5K,
+        GgmlType::Q6K => Kernel::MmvIdQ6K,
+        _ => return None,
+    })
+}
+
+/// The `mm_id` kernels, for the tiles of 32 pairs of passes of
+/// [`MM_ID_MIN`] tokens or more
+fn mm_id_kernel(ty: GgmlType) -> Option<Kernel> {
+    Some(match ty {
+        GgmlType::F32 => Kernel::MmIdF32,
+        GgmlType::F16 => Kernel::MmIdF16,
+        GgmlType::BF16 => Kernel::MmIdBf16,
+        GgmlType::Q4_0 => Kernel::MmIdQ4_0,
+        GgmlType::Q4_1 => Kernel::MmIdQ4_1,
+        GgmlType::Q8_0 => Kernel::MmIdQ8_0,
+        GgmlType::Q4K => Kernel::MmIdQ4K,
+        GgmlType::Q5K => Kernel::MmIdQ5K,
+        GgmlType::Q6K => Kernel::MmIdQ6K,
+        _ => return None,
+    })
+}
+
 fn mm_kernel(ty: GgmlType) -> Option<Kernel> {
     Some(match ty {
         GgmlType::F32 => Kernel::MmF32,
@@ -306,13 +412,30 @@ enum GpuMixer {
     },
 }
 
+enum GpuFfn {
+    Dense {
+        gate: GpuWeight,
+        up: GpuWeight,
+        down: GpuWeight,
+    },
+    Moe(Box<GpuMoe>),
+}
+
+/// see [`crate::model::Moe`]
+struct GpuMoe {
+    router: GpuWeight,
+    gate: GpuExperts,
+    up: GpuExperts,
+    down: GpuExperts,
+    /// gate, up, down, and the one row of its gate
+    shared: Option<[GpuWeight; 4]>,
+}
+
 struct GpuLayer {
     attn_norm: Buffer,
     post_norm: Buffer,
     mixer: GpuMixer,
-    ffn_gate: GpuWeight,
-    ffn_up: GpuWeight,
-    ffn_down: GpuWeight,
+    ffn: GpuFfn,
 }
 
 /// The MTP head, see [`crate::model::Mtp`]
@@ -361,11 +484,12 @@ fn zeroed(device: &Device, bytes: usize) -> Result<Buffer, Error> {
     Ok(buf)
 }
 
-/// Expose mmap'd weights to the GPU without copying them
-fn wrap(device: &Device, w: &Weight<'_>) -> Result<GpuWeight, Error> {
-    let addr = w.data.as_ptr() as usize;
+/// Expose mmap'd bytes to the GPU without copying them: the buffer of the
+/// pages holding them, and their offset in it
+fn map(device: &Device, data: &[u8]) -> Result<(Buffer, usize), Error> {
+    let addr = data.as_ptr() as usize;
     let start = addr & !(PAGE - 1);
-    let end = (addr + w.data.len()).next_multiple_of(PAGE);
+    let end = (addr + data.len()).next_multiple_of(PAGE);
     let ptr =
         NonNull::new(start as *mut c_void).ok_or_else(|| backend("metal: null weight pointer"))?;
     // read-only weights need no hazard tracking
@@ -375,6 +499,11 @@ fn wrap(device: &Device, w: &Weight<'_>) -> Result<GpuWeight, Error> {
         device.newBufferWithBytesNoCopy_length_options_deallocator(ptr, end - start, opts, None)
     }
     .ok_or_else(|| backend("metal: cannot map the weights (no-copy buffer)"))?;
+    Ok((buf, addr - start))
+}
+
+/// Expose mmap'd weights to the GPU without copying them
+fn wrap(device: &Device, w: &Weight<'_>) -> Result<GpuWeight, Error> {
     if mm_kernel(w.ty).is_none() {
         return Err(backend(format!("metal: no matmul kernel for {:?}", w.ty)));
     }
@@ -384,13 +513,41 @@ fn wrap(device: &Device, w: &Weight<'_>) -> Result<GpuWeight, Error> {
             w.cols
         )));
     }
+    let (buf, offset) = map(device, w.data)?;
     Ok(GpuWeight {
         buf,
-        offset: addr - start,
+        offset,
         ty: w.ty,
         cols: w.cols,
         rows: w.rows,
         row_bytes: w.ty.row_size(w.cols),
+    })
+}
+
+/// Expose the experts' matrices to the GPU without copying them
+fn wrap_experts(device: &Device, x: &Experts<'_>) -> Result<GpuExperts, Error> {
+    if mmv_id_kernel(x.ty).is_none() || mm_id_kernel(x.ty).is_none() {
+        return Err(backend(format!(
+            "metal: no expert matmul kernel for {:?}",
+            x.ty
+        )));
+    }
+    // `mmv_id` takes 4 spans of 32 per step
+    if !x.cols.is_multiple_of(128) {
+        return Err(backend(format!(
+            "metal: expert matmul width {} is not a multiple of 128",
+            x.cols
+        )));
+    }
+    let (buf, offset) = map(device, x.data)?;
+    Ok(GpuExperts {
+        buf,
+        offset: offset + x.offset,
+        ty: x.ty,
+        cols: x.cols,
+        rows: x.rows,
+        row_bytes: x.row_bytes(),
+        stride: x.stride,
     })
 }
 
@@ -424,9 +581,28 @@ fn gpu_layer(device: &Device, l: &Layer<'_>) -> Result<GpuLayer, Error> {
         attn_norm: upload(device, &l.attn_norm)?,
         post_norm: upload(device, &l.post_norm)?,
         mixer,
-        ffn_gate: wrap(device, &l.ffn_gate)?,
-        ffn_up: wrap(device, &l.ffn_up)?,
-        ffn_down: wrap(device, &l.ffn_down)?,
+        ffn: match &l.ffn {
+            Ffn::Dense { gate, up, down } => GpuFfn::Dense {
+                gate: wrap(device, gate)?,
+                up: wrap(device, up)?,
+                down: wrap(device, down)?,
+            },
+            Ffn::Moe(m) => GpuFfn::Moe(Box::new(GpuMoe {
+                router: wrap(device, &m.router)?,
+                gate: wrap_experts(device, &m.gate)?,
+                up: wrap_experts(device, &m.up)?,
+                down: wrap_experts(device, &m.down)?,
+                shared: match &m.shared {
+                    Some(s) => Some([
+                        wrap(device, &s.gate)?,
+                        wrap(device, &s.up)?,
+                        wrap(device, &s.down)?,
+                        wrap(device, &s.gate_inp)?,
+                    ]),
+                    None => None,
+                },
+            })),
+        },
     })
 }
 
@@ -767,6 +943,25 @@ struct Scratch {
     feat: Buffer,
     /// logits of up to `slots` tokens
     logits: Buffer,
+    moe: Option<MoeScratch>,
+}
+
+/// The buffers of a mixture of experts feed-forward, see `moe_route`
+struct MoeScratch {
+    /// router logits, per token
+    logits: Buffer,
+    /// expert and weight of each pair
+    ids: Buffer,
+    weights: Buffer,
+    /// pairs by expert, their tiles and the tile counts, for `mm_id` then
+    /// `mmv_id`
+    order: Buffer,
+    tiles: Buffer,
+    n_tiles: Buffer,
+    /// output of each pair
+    out: Buffer,
+    /// the shared expert's gate, per token
+    gate: Buffer,
 }
 
 /// The MTP head's history, see [`crate::model::Model::draft`]
@@ -826,8 +1021,30 @@ fn kv_bytes(context: usize, kv_dim: usize) -> usize {
         .saturating_mul(kv_dim)
 }
 
-/// Bytes of the buffers of [`Scratch`], in the order of its fields, for
-/// passes of `b` tokens and `slots` tokens of logits
+/// Most tiles of `moe_sort` for `n` tokens, for `mm_id` and for `mmv_id`:
+/// the full tiles, and a last one per expert (of `mm_min` pairs or more for
+/// `mm_id`). Also the most of any pass of fewer tokens: `tiles` holds both
+/// lists, the `mmv_id` one after the most `mm_id` tiles of the pass.
+fn max_tiles(c: &Config, n: usize, mm_min: usize) -> (usize, usize) {
+    c.moe.as_ref().map_or((0, 0), |m| {
+        let pairs = n * m.n_expert_used;
+        (
+            pairs / 32 + m.n_expert.min(pairs / mm_min),
+            pairs.div_ceil(8) + m.n_expert.min(pairs),
+        )
+    })
+}
+
+/// Width of a feed-forward's activations per token: the experts' of all of a
+/// token's pairs, or the shared expert's
+fn ffn_width(c: &Config) -> usize {
+    c.moe
+        .as_ref()
+        .map_or(c.n_ff, |m| (m.n_expert_used * m.n_ff_exp).max(m.n_ff_shexp))
+}
+
+/// Bytes of the buffers of [`Scratch`] but `moe`, in the order of its fields,
+/// for passes of `b` tokens and `slots` tokens of logits
 fn scratch_bytes(c: &Config, b: usize, slots: usize) -> [usize; 16] {
     let kv_dim = c.n_head_kv * c.head_dim;
     let qd = c.n_head * c.head_dim;
@@ -836,8 +1053,8 @@ fn scratch_bytes(c: &Config, b: usize, slots: usize) -> [usize; 16] {
         f32s(b * c.n_embd),
         f32s(b * c.n_embd),
         f32s(b * c.n_embd),
-        f32s(b * c.conv_dim().max(2 * qd).max(c.n_ff)),
-        f32s(b * c.n_ff.max(c.d_inner())),
+        f32s(b * c.conv_dim().max(2 * qd).max(ffn_width(c))),
+        f32s(b * ffn_width(c).max(c.d_inner())),
         f32s(b * kv_dim),
         f32s(b * kv_dim),
         f32s(b * qd),
@@ -850,6 +1067,26 @@ fn scratch_bytes(c: &Config, b: usize, slots: usize) -> [usize; 16] {
         f32s(b * c.n_embd),
         f32s(slots * c.n_vocab),
     ]
+}
+
+/// Bytes of the buffers of [`MoeScratch`], in the order of its fields, for
+/// passes of `b` tokens
+fn moe_bytes(c: &Config, b: usize) -> Option<[usize; 8]> {
+    let m = c.moe.as_ref()?;
+    let pairs = b * m.n_expert_used;
+    Some([
+        4 * b * m.n_expert,
+        4 * pairs,
+        4 * pairs,
+        4 * pairs,
+        16 * {
+            let (mm, mv) = max_tiles(c, b, MM_ID_MIN);
+            mm + mv
+        },
+        8,
+        4 * pairs * c.n_embd,
+        4 * b,
+    ])
 }
 
 /// Bytes of the buffers of [`MtpState`] but its kv caches and head: `emb`,
@@ -889,6 +1126,9 @@ impl Shape<'_> {
         let attention = self.attention_layers() + (draft > 0) as usize;
         let (conv, s) = self.delta_net_state();
         let mut scratch: usize = scratch_bytes(c, b, slots).map(pages).iter().sum();
+        if let Some(moe) = moe_bytes(c, b) {
+            scratch += moe.map(pages).iter().sum::<usize>();
+        }
         if draft > 0 {
             scratch += mtp_bytes(c, b).map(pages).iter().sum::<usize>();
         }
@@ -973,6 +1213,21 @@ impl<'e> MetalSession<'e> {
             beta: alloc(beta)?,
             feat: alloc(feat)?,
             logits: alloc(logits)?,
+            moe: match moe_bytes(c, b) {
+                Some([logits, ids, weights, order, tiles, n_tiles, out, gate]) => {
+                    Some(MoeScratch {
+                        logits: alloc(logits)?,
+                        ids: alloc(ids)?,
+                        weights: alloc(weights)?,
+                        order: alloc(order)?,
+                        tiles: alloc(tiles)?,
+                        n_tiles: alloc(n_tiles)?,
+                        out: alloc(out)?,
+                        gate: alloc(gate)?,
+                    })
+                }
+                None => None,
+            },
         };
         let mtp = if draft > 0 {
             let [emb, input, last, chain] = mtp_bytes(c, b);
@@ -1432,11 +1687,175 @@ impl<'e> MetalSession<'e> {
         e.elementwise(enc, Kernel::AddInplace, x, y, n * emb);
 
         e.rms_norm(enc, x, &layer.post_norm, h, None, n, emb);
-        e.matmul(enc, &layer.ffn_gate, h, n, B::at(&s.a1));
-        e.matmul(enc, &layer.ffn_up, h, n, B::at(&s.a2));
-        e.elementwise(enc, Kernel::Swiglu, B::at(&s.a1), B::at(&s.a2), n * c.n_ff);
-        e.matmul(enc, &layer.ffn_down, B::at(&s.a1), n, y);
-        e.elementwise(enc, Kernel::AddInplace, x, y, n * emb);
+        match &layer.ffn {
+            GpuFfn::Dense { gate, up, down } => {
+                self.encode_dense_ffn(enc, gate, up, down, n, y);
+                e.elementwise(enc, Kernel::AddInplace, x, y, n * emb);
+            }
+            GpuFfn::Moe(m) => self.encode_moe(
+                enc,
+                &m.router,
+                [&m.gate, &m.up, &m.down],
+                m.shared.as_ref(),
+                n,
+            ),
+        }
+    }
+
+    /// `down(silu(gate h) * up h)` of `n` tokens into `out`, through `a1`
+    /// and `a2`
+    fn encode_dense_ffn(
+        &self,
+        enc: &Encoder,
+        gate: &GpuWeight,
+        up: &GpuWeight,
+        down: &GpuWeight,
+        n: usize,
+        out: B<'_>,
+    ) {
+        let (e, s) = (self.e, &self.s);
+        let h = B::at(&s.h);
+        e.matmul(enc, gate, h, n, B::at(&s.a1));
+        e.matmul(enc, up, h, n, B::at(&s.a2));
+        e.elementwise(
+            enc,
+            Kernel::Swiglu,
+            B::at(&s.a1),
+            B::at(&s.a2),
+            n * gate.rows,
+        );
+        e.matmul(enc, down, B::at(&s.a1), n, out);
+    }
+
+    /// The mixture of experts of the normalized `n` tokens in `h`, added to
+    /// the residual stream `x`
+    fn encode_moe(
+        &self,
+        enc: &Encoder,
+        router: &GpuWeight,
+        [gate, up, down]: [&GpuExperts; 3],
+        shared: Option<&[GpuWeight; 4]>,
+        n: usize,
+    ) {
+        let e = self.e;
+        let c = e.cfg();
+        let s = &self.s;
+        let m = s.moe.as_ref().expect("moe scratch for a moe model");
+        let cm = c.moe.as_ref().expect("a moe config");
+        let (ne, k) = (cm.n_expert, cm.n_expert_used);
+        let h = B::at(&s.h);
+
+        // the shared expert first: the experts then take `a1` and `a2`
+        if let Some([sg, su, sd, gate_inp]) = shared {
+            self.encode_dense_ffn(enc, sg, su, sd, n, B::at(&s.y));
+            e.matmul(enc, gate_inp, h, n, B::at(&m.gate));
+        }
+
+        e.matmul(enc, router, h, n, B::at(&m.logits));
+        let (mm_tiles, mv_tiles) = max_tiles(c, n, MM_ID_MIN);
+        MetalEngine::args(
+            enc,
+            &RouteArgs {
+                n_expert: ne as i32,
+                k: k as i32,
+            },
+        );
+        MetalEngine::bind(enc, &[B::at(&m.logits), B::at(&m.ids), B::at(&m.weights)]);
+        e.dispatch(enc, Kernel::MoeRoute, [n, 1, 1], [256, 1, 1], 4 * ne);
+
+        MetalEngine::args(
+            enc,
+            &SortArgs {
+                n_pairs: (n * k) as i32,
+                n_expert: ne as i32,
+                mm_min: MM_ID_MIN as i32,
+                mv_base: mm_tiles as i32,
+            },
+        );
+        MetalEngine::bind(
+            enc,
+            &[
+                B::at(&m.ids),
+                B::at(&m.order),
+                B::at(&m.tiles),
+                B::at(&m.n_tiles),
+            ],
+        );
+        e.dispatch(enc, Kernel::MoeSort, [1, 1, 1], [256, 1, 1], 4 * 4 * ne);
+
+        let matmul = |w: &GpuExperts, x: B<'_>, x_div: usize, out: B<'_>| {
+            MetalEngine::args(
+                enc,
+                &MatIdArgs {
+                    k: w.cols as i32,
+                    rows: w.rows as i32,
+                    x_div: x_div as i32,
+                    pad: 0,
+                    w_row_bytes: w.row_bytes as u64,
+                    x_row_bytes: (w.cols * 4) as u64,
+                    stride: w.stride as u64,
+                },
+            );
+            let wb = B(&w.buf, w.offset);
+            // an expert has at most a pair per token
+            if n >= MM_ID_MIN {
+                let (tiles, n_tiles) = (B::at(&m.tiles), B::at(&m.n_tiles));
+                MetalEngine::bind(enc, &[wb, x, out, B::at(&m.order), tiles, n_tiles]);
+                e.dispatch(
+                    enc,
+                    mm_id_kernel(w.ty).expect("checked at load"),
+                    [mm_tiles, w.rows.div_ceil(64), 1],
+                    [128, 1, 1],
+                    8192,
+                );
+            }
+            let (tiles, n_tiles) = (B(&m.tiles, 16 * mm_tiles), B(&m.n_tiles, 4));
+            MetalEngine::bind(enc, &[wb, x, out, B::at(&m.order), tiles, n_tiles]);
+            e.dispatch(
+                enc,
+                mmv_id_kernel(w.ty).expect("checked at load"),
+                [w.rows.div_ceil(MMV_WEIGHT_ROWS), mv_tiles, 1],
+                [64, 1, 1],
+                0,
+            );
+        };
+        // a token's row for each of its pairs, then a row per pair
+        matmul(gate, h, k, B::at(&s.a1));
+        matmul(up, h, k, B::at(&s.a2));
+        e.elementwise(
+            enc,
+            Kernel::Swiglu,
+            B::at(&s.a1),
+            B::at(&s.a2),
+            n * k * gate.rows,
+        );
+        matmul(down, B::at(&s.a1), 1, B::at(&m.out));
+
+        MetalEngine::args(
+            enc,
+            &CombineArgs {
+                n_embd: c.n_embd as i32,
+                k: k as i32,
+                shared: shared.is_some() as i32,
+            },
+        );
+        MetalEngine::bind(
+            enc,
+            &[
+                B::at(&s.x),
+                B::at(&m.out),
+                B::at(&m.weights),
+                B::at(&s.y),
+                B::at(&m.gate),
+            ],
+        );
+        e.dispatch(
+            enc,
+            Kernel::MoeCombine,
+            [c.n_embd.div_ceil(256), n, 1],
+            [256, 1, 1],
+            0,
+        );
     }
 }
 

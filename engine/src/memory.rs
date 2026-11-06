@@ -186,9 +186,16 @@ impl Shape<'_> {
         // the largest layer's own activations
         let n = batch.max(draft + 1);
         let qd = c.n_head * c.head_dim;
+        // a mixture of experts: the router logits, the output, and the shared
+        // expert's or an expert's activations over its tokens
+        let moe = c
+            .moe
+            .as_ref()
+            .map_or(0, |m| m.n_expert + 2 * e + 2 * m.n_ff_shexp.max(m.n_ff_exp));
         let layer = (2 * c.n_ff)
             .max(5 * qd + 2 * kv_dim)
-            .max(3 * c.conv_dim() + 3 * c.d_inner());
+            .max(3 * c.conv_dim() + 3 * c.d_inner())
+            .max(moe);
         let activations = 4 * n * (3 * e + layer);
         // the logits of a verify pass, and their copy per token
         let logits = 2 * 4 * (draft + 1) * c.n_vocab;

@@ -1,7 +1,7 @@
 # biv — Brain In a Vat
 
-Pure Rust chat inference for **Qwen3.8** GGUF models (llama.cpp architecture
-`qwen35`), on Apple GPUs (Metal) or the CPU (aarch64 NEON, x86-64 AVX2 or AVX-VNNI). No
+Pure Rust chat inference for **Qwen3.8** GGUF models (llama.cpp architectures
+`qwen35` and `qwen35moe`), on Apple GPUs (Metal) or the CPU (aarch64 NEON, x86-64 AVX2 or AVX-VNNI). No
 C/C++ code and no bindings: the GGUF loader, the quantized kernels (NEON `sdot`,
 AVX2 `maddubs`, VNNI `vpdpbusd`, Metal shaders), the tokenizer, and the model graph are all in Rust
 or MSL. It needs Rust 1.98 or later, for the NEON dot product intrinsics.
@@ -52,6 +52,15 @@ hf download unsloth/Qwen3.5-4B-GGUF Qwen3.5-4B-Q8_0.gguf     # 4.5 GB
 ```
 
 Its GGUF has no MTP head, so it decodes without drafting (`--lookup` still works).
+
+The mixture-of-experts models (`qwen35moe`: 256 experts, 8 per token, plus a shared
+expert) also run on both backends. Qwen3.6 35B-A3B (Q8_0) decodes at about 45
+tokens/s on an M2 Max, and 60 to 90 with its MTP head drafting:
+
+```sh
+hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-Q8_0.gguf   # 37.8 GB
+./target/release/biv -m hf.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF:Q8_0
+```
 
 Decoding is speculative by default: the model's MTP head drafts the next tokens
 (4 on Metal, 1 on the CPU), and the trunk checks them in the same pass as the
@@ -135,11 +144,11 @@ time either way (cpuid). Its features:
 | `engine/src/ops.rs` | matmul (threaded with rayon), norms, rope, softmax |
 | `engine/src/par.rs` | rayon's parallel iterators, or sequential ones of the same names |
 | `engine/src/math.rs` | libm float functions without `std` |
-| `engine/src/model.rs` | the `qwen35` graph: port of llama.cpp `src/models/qwen35.cpp` and `delta-net-base.cpp`; MTP drafting |
+| `engine/src/model.rs` | the `qwen35` / `qwen35moe` graph: port of llama.cpp `src/models/qwen35.cpp`, `qwen35moe.cpp` and `delta-net-base.cpp`; expert routing; MTP drafting |
 | `engine/src/memory.rs` | memory of a model and its sessions: estimated from the GGUF alone (`Footprint`), or reported by engines and sessions |
 | `engine/src/engine.rs` | `Engine` / `Session` traits shared by the backends (draft / verify / keep for speculative decoding); CPU implementation |
 | `engine/src/metal/mod.rs` | Metal backend: no-copy weight buffers, per-session KV/recurrent state, one command buffer per forward pass |
-| `engine/src/metal/kernels.metal` | matvec / simdgroup matmul for each quant type (from ggml-metal), fused norm, rope, split-K (decode) and flash (prefill) attention, conv and gated delta-net kernels |
+| `engine/src/metal/kernels.metal` | matvec / simdgroup matmul for each quant type (from ggml-metal), fused norm, rope, split-K (decode) and flash (prefill) attention, conv and gated delta-net kernels, expert routing and the matmul / matvec over each expert's tokens |
 | `engine/src/tokenizer.rs` | byte-level BPE; the `qwen35` pre-tokenizer regex, matched by hand |
 | `engine/src/chat.rs` | chat template (ChatML with `<think>`), incremental multi-turn state, the speculative decoding loop |
 | `engine/src/sampler.rs` | temperature / top-k / top-p / min-p / penalties |

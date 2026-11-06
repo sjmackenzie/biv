@@ -202,6 +202,9 @@ node! {
         general: General,
         /// the hyperparameters of the `qwen35` architecture
         qwen35: Qwen35,
+        /// the hyperparameters of the `qwen35moe` architecture: `qwen35`'s,
+        /// with mixture of experts feed-forwards
+        qwen35moe: Qwen35,
         tokenizer: Tokenizer,
         split: Split,
     }
@@ -243,6 +246,14 @@ node! {
         attention: Attention,
         rope: Rope,
         ssm: Ssm,
+
+        /// the mixture of experts of `qwen35moe`: experts per layer, and
+        /// used per token
+        expert_count: Option<u64>,
+        expert_used_count: Option<u64>,
+        /// the width of an expert's feed-forward, and the shared expert's
+        expert_feed_forward_length: Option<u64>,
+        expert_shared_feed_forward_length: Option<u64>,
     }
 
     pub struct Attention {
@@ -303,8 +314,18 @@ node! {
 }
 
 /// The value of a required leaf, by reference, or [`Error::MissingKey`] with
-/// its dotted key: `need!(meta, qwen35.block_count)?`
+/// its dotted key: `need!(meta, qwen35.block_count)?`. For a section whose
+/// key prefix is only known at run time, `need!(section @ prefix, block_count)?`.
 macro_rules! need {
+    ($m:expr, @ $prefix:expr, $($p:ident).+) => {
+        $m.$($p).+.as_ref().ok_or_else(|| {
+            $crate::Error::MissingKey(::alloc::format!(
+                "{}.{}",
+                $prefix,
+                [$(stringify!($p)),+].join(".")
+            ))
+        })
+    };
     ($m:expr, $($p:ident).+) => {
         $m.$($p).+.as_ref().ok_or_else(|| {
             $crate::Error::MissingKey([$(stringify!($p)),+].join("."))
