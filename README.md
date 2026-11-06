@@ -151,6 +151,7 @@ time either way (cpuid). Its features:
 | `engine/src/metal/kernels.metal` | matvec / simdgroup matmul for each quant type (from ggml-metal), fused norm, rope, split-K (decode) and flash (prefill) attention, conv and gated delta-net kernels, expert routing and the matmul / matvec over each expert's tokens |
 | `engine/src/tokenizer.rs` | byte-level BPE; the `qwen35` pre-tokenizer regex, matched by hand |
 | `engine/src/chat.rs` | chat template (ChatML with `<think>`), incremental multi-turn state, the speculative decoding loop |
+| `engine/src/transcript.rs` | a conversation as token ids, and its bytes |
 | `engine/src/sampler.rs` | temperature / top-k / top-p / min-p / penalties |
 | `src/lib.rs` | GGUF files: shard discovery, mmap |
 | `src/hf.rs` | Hugging Face cache lookup |
@@ -220,6 +221,17 @@ whole sequence state: the KV cache of its tokens plus the delta net states,
 about 150 MB for this model, plus 64 KB per token on Metal (128 KB on the CPU,
 whose caches are f32).
 
+A conversation can also be kept as its token ids alone (`Chat::transcript`, a
+`Transcript`: the tokens, how many of the last ones are still to be processed,
+and the generated ones for the sampler's penalties), 4 bytes per token, and
+restored in any chat on a model with the same vocabulary
+(`Chat::restore_transcript`), which processes the tokens again. `Chat::n_tokens`
+gives its length without copying it. `Transcript::to_bytes` and `from_bytes`
+(`engine/src/transcript.rs`, where the layout is) write it with a 20-byte header,
+its token ids in one of two encodings: `Full`, a u32 per token, or `Compact`, a
+u16 per token below 0xffff and, from 0xffff, the escape 0xffff followed by a u32
+of the id minus 0xffff (0xffff is `ff ff 00 00 00 00`).
+
 ## Verification
 
 - Kernel tests: `cargo test --workspace --release` compares every SIMD kernel
@@ -246,7 +258,8 @@ whose caches are f32).
   (f16 KV cache, half-precision matmul tiles).
 - `examples/prefix.rs <gguf> [--cpu] [-n tokens]`: a chat restored from a saved
   system prompt or first turn gives the same greedy answer as the chat that
-  saved it, on Metal and on the CPU, with or without drafts.
+  saved it, on Metal and on the CPU, with or without drafts; so does a chat
+  restored from the first turn's transcript, processed again.
 - `examples/tools.rs <gguf> [--cpu]`: the first prompt with tools has the tokens
   of the template text rendered by hand; the model calls both tools of a two-part
   question, answers from their results, and answers directly when no tool

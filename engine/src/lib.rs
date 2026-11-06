@@ -23,6 +23,7 @@ pub mod ops;
 pub mod quant;
 pub mod sampler;
 pub mod tokenizer;
+pub mod transcript;
 
 mod math;
 mod par;

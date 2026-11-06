@@ -13,7 +13,10 @@
 //! A conversation can be saved at any point between turns and restored later,
 //! in the same chat or another one on the same engine: [`Chat::save`] before the
 //! first message saves the processed system prompt, so that conversations
-//! starting with it don't process it again.
+//! starting with it don't process it again. Its token ids alone
+//! ([`Chat::transcript`]) take a few bytes per token and restore in any chat on
+//! a model with the same vocabulary, by processing them again
+//! ([`Chat::restore_transcript`]).
 
 use alloc::collections::VecDeque;
 
@@ -23,6 +26,7 @@ use crate::memory::SessionMemory;
 use crate::prelude::*;
 use crate::sampler::Sampler;
 use crate::tokenizer::{PromptPart, StreamDecoder, TokenId, Tokenizer};
+pub use crate::transcript::Transcript;
 
 use PromptPart::{Content, Template};
 
@@ -305,6 +309,72 @@ impl<'m> Chat<'m> {
         self.pending.clone_from(&prefix.pending);
         self.generated.clone_from(&prefix.generated);
         self.history.clone_from(&prefix.history);
+        self.lookup_run = 0;
+        Ok(())
+    }
+
+    /// Tokens of the conversation so far: those processed, and the end of the
+    /// last answer, processed with the next message
+    pub fn n_tokens(&self) -> usize {
+        self.history.len() + self.pending.len()
+    }
+
+    /// The conversation so far as token ids, to [`Chat::restore_transcript`]
+    /// in any chat whose model has the same vocabulary. Nothing is processed:
+    /// before the first message it is empty, unlike [`Chat::save`].
+    pub fn transcript(&self) -> Transcript {
+        let mut tokens = Vec::with_capacity(self.n_tokens());
+        tokens.extend_from_slice(&self.history);
+        tokens.extend_from_slice(&self.pending);
+        Transcript {
+            tokens,
+            pending: self.pending.len(),
+            generated: self.generated.clone(),
+        }
+    }
+
+    /// Replace the conversation with `transcript`, processing its tokens
+    /// again. Its system prompt, reasoning instructions and tools are those
+    /// of the chat that made it, whatever `opts` says, as with
+    /// [`Chat::restore`]. The answers that follow are those of the chat
+    /// that made it up to rounding: its tokens were processed in other
+    /// passes. Nothing changes when it doesn't fit.
+    pub fn restore_transcript(&mut self, transcript: &Transcript) -> Result<(), Error> {
+        let Transcript {
+            tokens,
+            pending,
+            generated,
+        } = transcript;
+        if *pending > tokens.len() {
+            return Err(Error::Transcript("more pending tokens than tokens"));
+        }
+        if *pending > 0 && *pending == tokens.len() {
+            return Err(Error::Transcript("pending tokens without a conversation"));
+        }
+        let n_vocab = self.tok.n_vocab();
+        if tokens
+            .iter()
+            .chain(generated)
+            .any(|&t| t as usize >= n_vocab)
+        {
+            return Err(Error::Transcript("token id past the vocabulary"));
+        }
+        // the processed tokens and those of the next message's end
+        if tokens.len() >= self.opts.context {
+            return Err(Error::ContextFull {
+                n_past: 0,
+                prompt: tokens.len(),
+                context: self.opts.context,
+            });
+        }
+        if self.session.n_past() > 0 {
+            self.reset()?;
+        }
+        let (processed, rest) = transcript.split();
+        self.prefill(processed);
+        self.history = processed.to_vec();
+        self.pending = rest.to_vec();
+        self.generated.clone_from(generated);
         self.lookup_run = 0;
         Ok(())
     }

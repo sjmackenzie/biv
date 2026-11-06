@@ -62,6 +62,8 @@ pub enum Error {
     },
     /// A snapshot that can't be restored in this session
     Snapshot(&'static str),
+    /// A transcript that can't be read, or restored in this chat
+    Transcript(&'static str),
     /// The GPU backend failed: no device, shader compilation, ...
     Backend(String),
 }
@@ -110,6 +112,7 @@ impl fmt::Display for Error {
                 write!(f, "context full ({n_past} + {prompt} tokens > {context})")
             }
             Error::Snapshot(why) => write!(f, "cannot restore the snapshot: {why}"),
+            Error::Transcript(why) => write!(f, "invalid transcript: {why}"),
             Error::Backend(msg) => f.write_str(msg),
         }
     }

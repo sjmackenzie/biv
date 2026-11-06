@@ -9,6 +9,7 @@ use biv::{
     model::Model,
     sampler::{Sampler, SamplerConfig},
     tokenizer::Tokenizer,
+    transcript::{TokenEncoding, Transcript},
 };
 
 const SYSTEM: &str = "You are a terse assistant for a team of embedded systems engineers. \
@@ -119,7 +120,7 @@ fn main() {
         system: None,
         ..opts.clone()
     };
-    let mut restored = Chat::new(engine, &tok, other).unwrap();
+    let mut restored = Chat::new(engine, &tok, other.clone()).unwrap();
     restored.restore(&system).unwrap();
     let (c1, n, t) = ask(&mut restored, q1);
     println!("restored: first prompt {n} tokens in {t:.2}s");
@@ -134,6 +135,50 @@ fn main() {
             &b2,
             &c2,
         );
+    }
+
+    // the same conversations as token ids, processed again
+    let mut replayer = Chat::new(engine, &tok, opts.clone()).unwrap();
+    let empty = replayer.transcript();
+    println!(
+        "transcript before the first message: {} tokens",
+        empty.len()
+    );
+    let (r1, ..) = ask(&mut replayer, q1);
+    check("first answer after an empty transcript", &a1, &r1);
+    let transcript = replayer.transcript();
+    assert_eq!(transcript.len(), replayer.n_tokens());
+    let (processed, rest) = transcript.split();
+    assert_eq!(processed.len(), replayer.n_past());
+    println!(
+        "transcript of the first turn: {} tokens, {} pending, {} generated",
+        transcript.len(),
+        rest.len(),
+        transcript.generated.len()
+    );
+    // through bytes, in both token encodings
+    for encoding in [TokenEncoding::Full, TokenEncoding::Compact] {
+        let bytes = transcript.to_bytes(encoding);
+        println!("  {encoding:?}: {} bytes", bytes.len());
+        assert_eq!(Transcript::from_bytes(&bytes).unwrap(), transcript);
+    }
+    let mut replayed = Chat::new(engine, &tok, other.clone()).unwrap();
+    for i in 0..2 {
+        let t = Instant::now();
+        replayed.restore_transcript(&transcript).unwrap();
+        println!(
+            "restored the transcript in {:.2}s",
+            t.elapsed().as_secs_f64()
+        );
+        assert_eq!(replayed.transcript(), transcript);
+        let (r2, ..) = ask(&mut replayed, q2);
+        check(&format!("second turn from the transcript ({i})"), &b2, &r2);
+    }
+    let mut bad = transcript.clone();
+    bad.tokens.push(tok.n_vocab() as u32);
+    match replayed.restore_transcript(&bad) {
+        Err(e) => println!("  token id past the vocabulary: {e}"),
+        Ok(()) => println!("  token id past the vocabulary: RESTORED"),
     }
 
     // drafting settings may differ, but a drafting session needs the MTP history
