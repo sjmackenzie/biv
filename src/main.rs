@@ -181,6 +181,60 @@ fn print_stats(s: &TurnStats, prompt_time: Duration, gen_time: Duration, style: 
     );
 }
 
+/// A memory size, in MB or GB
+fn size(bytes: usize) -> String {
+    match bytes as f64 {
+        b if b < 1e9 => format!("{:.1} MB", b / 1e6),
+        b => format!("{:.2} GB", b / 1e9),
+    }
+}
+
+/// The context in use and the memory of the model, the session and the device
+fn print_memory(chat: &Chat<'_>, engine: &dyn Engine) {
+    let (n, m) = (chat.n_past(), chat.memory());
+    let pct = |a: usize, b: usize| 100.0 * a as f64 / b.max(1) as f64;
+    eprintln!(
+        "{n} / {} context tokens ({:.1}%)",
+        chat.opts.context,
+        pct(n, chat.opts.context)
+    );
+    let mut parts = vec![format!("kv {} ({} in use)", size(m.kv), size(m.kv_used(n)))];
+    for (name, bytes) in [
+        ("recurrent", m.recurrent),
+        ("draft head", m.draft_head),
+        ("scratch", m.scratch),
+    ] {
+        if bytes > 0 {
+            parts.push(format!("{name} {}", size(bytes)));
+        }
+    }
+    eprintln!(
+        "session: {}: {}; up to {} more during a pass",
+        size(m.allocated()),
+        parts.join(", "),
+        size(m.transient)
+    );
+    let w = engine.model_memory();
+    eprintln!(
+        "model: {} of weights, mapped{}; {} of params",
+        size(w.weights),
+        if w.mtp_weights > 0 {
+            format!(", and {} for the MTP head", size(w.mtp_weights))
+        } else {
+            String::new()
+        },
+        size(w.params)
+    );
+    if let Some(d) = engine.device_memory() {
+        eprintln!(
+            "gpu: {} allocated, {:.0}% of the {} working set",
+            size(d.allocated),
+            pct(d.allocated, d.working_set),
+            size(d.working_set)
+        );
+    }
+}
+
 fn make_engine<'m>(
     model: &'m Model<'m>,
     cpu: bool,
@@ -309,6 +363,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
     }
     let mut sampler = Sampler::new(sampler_cfg);
+    if let Some(device) = engine.device_memory() {
+        let needed =
+            engine.model_memory().total() + Chat::session_memory(engine.as_ref(), &opts).peak();
+        if needed > device.working_set {
+            eprintln!(
+                "warning: the model and a {}-token context need {}, more than the {} the GPU works well with; try a smaller --ctx",
+                opts.context,
+                size(needed),
+                size(device.working_set)
+            );
+        }
+    }
     let mut chat = Chat::new(engine.as_ref(), &tok, opts)?;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -417,12 +483,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 chat.opts.thinking = msg == "/think";
                 eprintln!("thinking {}", if chat.opts.thinking { "on" } else { "off" });
             }
-            "/stats" => eprintln!(
-                "{} / {} context tokens, {:.1} MB of state",
-                chat.n_past(),
-                chat.opts.context,
-                chat.state_bytes() as f64 / 1e6
-            ),
+            "/stats" => print_memory(&chat, engine.as_ref()),
             _ if msg.starts_with('/') => eprintln!("unknown command {msg}"),
             _ => {
                 if let Err(e) = answer(&mut chat, msg, &mut sampler) {

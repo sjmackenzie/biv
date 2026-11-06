@@ -14,6 +14,7 @@ use crate::engine::DraftLogits;
 use crate::gguf::{Gguf, TensorInfo, need, tensor};
 #[cfg(not(any(feature = "std", test)))]
 use crate::math::Float;
+use crate::memory::{ModelMemory, SessionMemory, Shape};
 use crate::ops::{self, Input, Weight, matmul_new};
 use crate::par::*;
 use crate::prelude::*;
@@ -170,6 +171,7 @@ pub struct Model<'a> {
     pub(crate) layers: Vec<Layer<'a>>,
     pub(crate) mtp: Option<Mtp<'a>>,
     pub(crate) inv_freq: Vec<f32>,
+    pub(crate) memory: ModelMemory,
 }
 
 struct Loader<'g> {
@@ -301,6 +303,7 @@ impl<'a> Model<'a> {
 
         Ok(Model {
             output_norm: l.vec(tensor!(t, output_norm.weight), e)?,
+            memory: ModelMemory::from_gguf(g, &cfg, mtp.is_some()),
             cfg,
             tok_embd,
             output,
@@ -313,6 +316,14 @@ impl<'a> Model<'a> {
     /// Whether the model can draft tokens for speculative decoding
     pub fn has_mtp(&self) -> bool {
         self.mtp.is_some()
+    }
+
+    pub(crate) fn shape(&self) -> Shape<'_> {
+        Shape {
+            cfg: &self.cfg,
+            has_mtp: self.has_mtp(),
+            head_row_bytes: self.output.data.len() / self.output.rows,
+        }
     }
 
     /// An empty sequence able to hold `context` tokens, its memory allocated
@@ -364,14 +375,21 @@ impl<'a> Model<'a> {
         } else {
             None
         };
-        Ok(State {
+        let state = State {
             layers,
             n_past: 0,
             context,
             kv_dim,
             mtp,
             verify: None,
-        })
+        };
+        debug_assert_eq!(
+            state.memory().allocated(),
+            self.shape()
+                .cpu_session(context, state.mtp.is_some() as usize, 1)
+                .allocated()
+        );
+        Ok(state)
     }
 
     /// Run `tokens` through the model, appending them to `state`.
@@ -883,16 +901,6 @@ fn zeroed(n: usize) -> Result<Vec<f32>, Error> {
     Ok(v)
 }
 
-impl LayerState {
-    /// Memory held, whether used yet or not
-    fn bytes(&self) -> usize {
-        match self {
-            LayerState::Attention { k, v } => (k.capacity() + v.capacity()) * 4,
-            LayerState::DeltaNet { conv, s, .. } => (conv.len() + s.len()) * 4,
-        }
-    }
-}
-
 struct MtpState {
     kv: LayerState,
     /// rows entered: row `p` pairs token `p + 1` with the hidden state of token `p`
@@ -1017,18 +1025,24 @@ pub struct State {
 }
 
 impl State {
-    pub fn kv_bytes(&self) -> usize {
-        let head = self
-            .mtp
-            .as_ref()
-            .and_then(|m| m.head.as_ref())
-            .map_or(0, |(_, rows)| rows.capacity());
-        self.layers
-            .iter()
-            .chain(self.mtp.as_ref().map(|m| &m.kv))
-            .map(LayerState::bytes)
-            .sum::<usize>()
-            + head
+    /// The memory the state holds, measured, but
+    /// [`SessionMemory::transient`]: what its passes allocate
+    pub fn memory(&self) -> SessionMemory {
+        let mut m = SessionMemory::default();
+        for ls in self.layers.iter().chain(self.mtp.as_ref().map(|m| &m.kv)) {
+            match ls {
+                LayerState::Attention { k, v } => {
+                    m.kv += 4 * (k.capacity() + v.capacity());
+                    m.kv_per_token += 2 * 4 * self.kv_dim;
+                }
+                LayerState::DeltaNet { conv, s, .. } => m.recurrent += 4 * (conv.len() + s.len()),
+            }
+        }
+        if let Some(mtp) = &self.mtp {
+            m.scratch += 4 * mtp.last.len();
+            m.draft_head = mtp.head.as_ref().map_or(0, |(_, rows)| rows.capacity());
+        }
+        m
     }
 
     /// A copy of the state: the kv caches of the `n_past` tokens, the delta net states

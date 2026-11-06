@@ -62,9 +62,9 @@ code. The output follows the same distribution as without drafting: greedy, it
 is the same text.
 
 In the chat, `/reset` clears the conversation, `/think` and `/nothink` toggle
-reasoning for the next answers, `/stats` shows context use, Ctrl-C stops an
-answer, and a trailing `\` continues a message on the next line. Run `--help` for
-the sampling and context options. Sampling defaults come from the GGUF
+reasoning for the next answers, `/stats` shows context and memory use, Ctrl-C
+stops an answer, and a trailing `\` continues a message on the next line. Run
+`--help` for the sampling and context options. Sampling defaults come from the GGUF
 (`general.sampling.*`).
 
 ## Fingerprint
@@ -136,6 +136,7 @@ time either way (cpuid). Its features:
 | `engine/src/par.rs` | rayon's parallel iterators, or sequential ones of the same names |
 | `engine/src/math.rs` | libm float functions without `std` |
 | `engine/src/model.rs` | the `qwen35` graph: port of llama.cpp `src/models/qwen35.cpp` and `delta-net-base.cpp`; MTP drafting |
+| `engine/src/memory.rs` | memory of a model and its sessions: estimated from the GGUF alone (`Footprint`), or reported by engines and sessions |
 | `engine/src/engine.rs` | `Engine` / `Session` traits shared by the backends (draft / verify / keep for speculative decoding); CPU implementation |
 | `engine/src/metal/mod.rs` | Metal backend: no-copy weight buffers, per-session KV/recurrent state, one command buffer per forward pass |
 | `engine/src/metal/kernels.metal` | matvec / simdgroup matmul for each quant type (from ggml-metal), fused norm, rope, split-K (decode) and flash (prefill) attention, conv and gated delta-net kernels |

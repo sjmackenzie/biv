@@ -4,6 +4,7 @@
 use core::any::Any;
 
 use crate::Error;
+use crate::memory::{DeviceMemory, ModelMemory, SessionMemory};
 use crate::model::{Model, State, StateSnapshot};
 use crate::par;
 use crate::prelude::*;
@@ -22,6 +23,19 @@ pub trait Engine {
     fn draft_size(&self) -> usize;
 
     fn description(&self) -> String;
+
+    /// The memory of the model on this backend
+    fn model_memory(&self) -> ModelMemory;
+
+    /// The memory of a session [`Engine::new_session`] would make with
+    /// `context` and `draft`, without making it
+    fn session_memory(&self, context: usize, draft: usize) -> SessionMemory;
+
+    /// The memory of the device the backend computes on, when it has its own
+    /// accounting: allocated now, and its budget
+    fn device_memory(&self) -> Option<DeviceMemory> {
+        None
+    }
 
     /// What decides the numbers this backend computes, besides the code, the
     /// weights and how the tokens are batched: kernel variants, cache types,
@@ -62,8 +76,9 @@ pub trait Session {
     /// Tokens in the sequence
     fn n_past(&self) -> usize;
 
-    /// Memory held by the sequence state
-    fn state_bytes(&self) -> usize;
+    /// The memory of the session: allocated, and [`SessionMemory::kv_used`]
+    /// with [`Session::n_past`] for the part of the kv caches in use
+    fn memory(&self) -> SessionMemory;
 
     /// A copy of the sequence, to [`Session::restore`] in sessions of the same
     /// engine. Not between [`Session::verify`] and [`Session::keep`].
@@ -154,6 +169,18 @@ impl<T: Engine + ?Sized> Engine for &T {
         (**self).description()
     }
 
+    fn model_memory(&self) -> ModelMemory {
+        (**self).model_memory()
+    }
+
+    fn session_memory(&self, context: usize, draft: usize) -> SessionMemory {
+        (**self).session_memory(context, draft)
+    }
+
+    fn device_memory(&self) -> Option<DeviceMemory> {
+        (**self).device_memory()
+    }
+
     fn numerics(&self) -> Vec<(&'static str, String)> {
         (**self).numerics()
     }
@@ -179,6 +206,14 @@ impl Engine for Model<'_> {
 
     fn description(&self) -> String {
         format!("cpu, {} threads", par::threads())
+    }
+
+    fn model_memory(&self) -> ModelMemory {
+        self.memory
+    }
+
+    fn session_memory(&self, context: usize, draft: usize) -> SessionMemory {
+        self.shape().cpu_session(context, draft, self.batch_size())
     }
 
     // not the thread count: each output row is computed whole by one thread
@@ -228,8 +263,12 @@ impl Session for CpuSession<'_> {
         self.state.n_past
     }
 
-    fn state_bytes(&self) -> usize {
-        self.state.kv_bytes()
+    fn memory(&self) -> SessionMemory {
+        let estimate = self.model.session_memory(self.state.context, self.draft);
+        SessionMemory {
+            transient: estimate.transient,
+            ..self.state.memory()
+        }
     }
 
     fn snapshot(&self) -> Result<Snapshot, Error> {

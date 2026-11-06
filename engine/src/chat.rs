@@ -19,6 +19,7 @@ use alloc::collections::VecDeque;
 
 use crate::Error;
 use crate::engine::{DraftLogits, Engine, Session, Snapshot};
+use crate::memory::SessionMemory;
 use crate::prelude::*;
 use crate::sampler::Sampler;
 use crate::tokenizer::{PromptPart, StreamDecoder, TokenId, Tokenizer};
@@ -192,6 +193,14 @@ impl Prefix {
     }
 }
 
+/// The draft length of a chat's session: room to verify the MTP head's drafts
+/// and the proposals from the conversation
+fn session_draft(engine: &dyn Engine, opts: &ChatOptions) -> usize {
+    opts.draft
+        .unwrap_or_else(|| engine.draft_size())
+        .max(opts.lookup)
+}
+
 pub struct Chat<'m> {
     engine: &'m dyn Engine,
     tok: &'m Tokenizer,
@@ -218,11 +227,10 @@ impl<'m> Chat<'m> {
         opts: ChatOptions,
     ) -> Result<Self, Error> {
         let id = |s: &str| tok.token_id(s).ok_or_else(|| Error::MissingToken(s.into()));
-        let draft = opts.draft.unwrap_or_else(|| engine.draft_size());
         Ok(Chat {
             engine,
             tok,
-            session: engine.new_session(opts.context, draft.max(opts.lookup))?,
+            session: engine.new_session(opts.context, session_draft(engine, &opts))?,
             opts,
             pending: Vec::new(),
             generated: Vec::new(),
@@ -240,7 +248,7 @@ impl<'m> Chat<'m> {
         self.session = Box::new(Empty);
         self.session = self
             .engine
-            .new_session(self.opts.context, self.draft().max(self.opts.lookup))?;
+            .new_session(self.opts.context, session_draft(self.engine, &self.opts))?;
         self.pending.clear();
         self.generated.clear();
         self.history.clear();
@@ -252,8 +260,15 @@ impl<'m> Chat<'m> {
         self.session.n_past()
     }
 
-    pub fn state_bytes(&self) -> usize {
-        self.session.state_bytes()
+    /// The memory of the conversation's session
+    pub fn memory(&self) -> SessionMemory {
+        self.session.memory()
+    }
+
+    /// The memory of the session a chat on `engine` with `opts` would make,
+    /// without making it
+    pub fn session_memory(engine: &dyn Engine, opts: &ChatOptions) -> SessionMemory {
+        engine.session_memory(opts.context, session_draft(engine, opts))
     }
 
     /// Save the conversation so far, to [`Chat::restore`] it in this chat or
@@ -793,8 +808,8 @@ impl Session for Empty {
     fn n_past(&self) -> usize {
         0
     }
-    fn state_bytes(&self) -> usize {
-        0
+    fn memory(&self) -> SessionMemory {
+        SessionMemory::default()
     }
     fn snapshot(&self) -> Result<Snapshot, Error> {
         unreachable!()

@@ -15,6 +15,7 @@ pub mod chat;
 pub mod engine;
 mod error;
 pub mod gguf;
+pub mod memory;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
 pub mod model;

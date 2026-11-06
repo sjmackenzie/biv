@@ -17,6 +17,7 @@ use objc2_metal::{
 
 use crate::Error;
 use crate::engine::{DraftLogits, Engine, Session, Snapshot};
+use crate::memory::{DeviceMemory, ModelMemory, SessionMemory, Shape};
 use crate::model::{Config, DRAFT_CAP, DraftVocab, Layer, Mixer, Model, copy_head_rows};
 use crate::ops::Weight;
 use crate::prelude::*;
@@ -653,6 +654,28 @@ impl Engine for MetalEngine<'_> {
         format!("metal, {}", self.device.name())
     }
 
+    // the small vectors are uploaded, the weights mapped
+    fn model_memory(&self) -> ModelMemory {
+        let m = self.model.memory;
+        ModelMemory {
+            params: 2 * m.params,
+            ..m
+        }
+    }
+
+    fn session_memory(&self, context: usize, draft: usize) -> SessionMemory {
+        self.model
+            .shape()
+            .metal_session(context, draft, self.max_batch)
+    }
+
+    fn device_memory(&self) -> Option<DeviceMemory> {
+        Some(DeviceMemory {
+            allocated: self.device.currentAllocatedSize(),
+            working_set: self.device.recommendedMaxWorkingSetSize() as usize,
+        })
+    }
+
     // the batch size sets the split-K attention's splits
     fn numerics(&self) -> Vec<(&'static str, String)> {
         vec![
@@ -788,34 +811,124 @@ struct MetalSession<'e> {
     verify_from: Option<usize>,
     context: usize,
     n_past: usize,
-    bytes: usize,
+    memory: SessionMemory,
+}
+
+/// Bytes the device allocates for a buffer of `n`: whole pages
+fn pages(n: usize) -> usize {
+    n.max(4).next_multiple_of(PAGE)
+}
+
+/// Bytes of a kv cache, keys or values: f16, see `attn_flash`
+fn kv_bytes(context: usize, kv_dim: usize) -> usize {
+    2 * context
+        .next_multiple_of(ATTN_FLASH_C)
+        .saturating_mul(kv_dim)
+}
+
+/// Bytes of the buffers of [`Scratch`], in the order of its fields, for
+/// passes of `b` tokens and `slots` tokens of logits
+fn scratch_bytes(c: &Config, b: usize, slots: usize) -> [usize; 16] {
+    let kv_dim = c.n_head_kv * c.head_dim;
+    let qd = c.n_head * c.head_dim;
+    let f32s = |n: usize| 4 * n;
+    [
+        f32s(b * c.n_embd),
+        f32s(b * c.n_embd),
+        f32s(b * c.n_embd),
+        f32s(b * c.conv_dim().max(2 * qd).max(c.n_ff)),
+        f32s(b * c.n_ff.max(c.d_inner())),
+        f32s(b * kv_dim),
+        f32s(b * kv_dim),
+        f32s(b * qd),
+        f32s(b * qd.max(c.d_inner())),
+        f32s(b * c.conv_dim()),
+        f32s(attn_parts(c, b) * c.head_dim),
+        f32s(2 * attn_parts(c, b)),
+        f32s(b * c.ssm_v_heads),
+        f32s(b * c.ssm_v_heads),
+        f32s(b * c.n_embd),
+        f32s(slots * c.n_vocab),
+    ]
+}
+
+/// Bytes of the buffers of [`MtpState`] but its kv caches and head: `emb`,
+/// `input`, `last`, `chain`
+fn mtp_bytes(c: &Config, b: usize) -> [usize; 4] {
+    [
+        4 * b * c.n_embd,
+        4 * b * 2 * c.n_embd,
+        4 * c.n_embd,
+        4 * c.n_embd,
+    ]
+}
+
+impl Shape<'_> {
+    /// Tokens drafted per step by a session asked for `draft`: a verify pass
+    /// is one chunk
+    fn metal_draft(&self, draft: usize, max_batch: usize) -> usize {
+        if self.has_mtp {
+            draft.min(max_batch.max(1) - 1)
+        } else {
+            0
+        }
+    }
+
+    /// What [`MetalEngine::new_session`](Engine::new_session) allocates, in
+    /// whole pages as the device does
+    pub(crate) fn metal_session(
+        &self,
+        context: usize,
+        draft: usize,
+        max_batch: usize,
+    ) -> SessionMemory {
+        let c = self.cfg;
+        let b = max_batch.max(1);
+        let draft = self.metal_draft(draft, b);
+        let slots = draft + 1;
+        let attention = self.attention_layers() + (draft > 0) as usize;
+        let (conv, s) = self.delta_net_state();
+        let mut scratch: usize = scratch_bytes(c, b, slots).map(pages).iter().sum();
+        if draft > 0 {
+            scratch += mtp_bytes(c, b).map(pages).iter().sum::<usize>();
+        }
+        SessionMemory {
+            kv: attention * 2 * pages(kv_bytes(context, self.kv_dim())),
+            recurrent: self.delta_net_layers() * (pages(slots * 4 * conv) + pages(slots * 4 * s)),
+            draft_head: if draft > 0 && self.draft_head() > 0 {
+                pages(self.draft_head())
+            } else {
+                0
+            },
+            scratch,
+            // the logits of a verify pass, copied out
+            transient: 4 * slots * c.n_vocab,
+            kv_per_token: attention * 2 * 2 * self.kv_dim(),
+        }
+    }
 }
 
 impl<'e> MetalSession<'e> {
     fn new(e: &'e MetalEngine<'e>, context: usize, draft: usize) -> Result<Self, Error> {
         let c = e.cfg();
         let dev = &e.device;
-        let kv_dim = c.n_head_kv * c.head_dim;
-        // f16 kv caches, see `attn_flash`
-        let kv_bytes = 2 * context.next_multiple_of(ATTN_FLASH_C) * kv_dim;
-        // a verify pass is one chunk
-        let draft = if e.mtp.is_some() {
-            draft.min(e.max_batch - 1)
-        } else {
-            0
-        };
+        let shape = e.model.shape();
+        let memory = shape.metal_session(context, draft, e.max_batch);
+        let draft = shape.metal_draft(draft, e.max_batch);
         let slots = draft + 1;
+        let kv_bytes = kv_bytes(context, shape.kv_dim());
+        let (conv, s) = shape.delta_net_state();
         let mut bytes = 0;
         let mut alloc = |n: usize| {
-            bytes += n;
+            bytes += pages(n);
             zeroed(dev, n)
         };
         let mut layers = Vec::with_capacity(c.n_layer);
         for &r in &c.recurrent {
             layers.push(if r {
                 LayerState::DeltaNet {
-                    conv: alloc(slots * 4 * (c.conv_kernel - 1) * c.conv_dim())?,
-                    s: alloc(slots * 4 * c.ssm_v_heads * c.ssm_state * c.ssm_state)?,
+                    conv: alloc(slots * 4 * conv)?,
+                    s: alloc(slots * 4 * s)?,
                 }
             } else {
                 LayerState::Attention {
@@ -825,36 +938,54 @@ impl<'e> MetalSession<'e> {
             });
         }
         let b = e.max_batch;
-        let qd = c.n_head * c.head_dim;
+        let [
+            x,
+            h,
+            y,
+            a1,
+            a2,
+            k,
+            v,
+            q,
+            o,
+            conv_out,
+            part_o,
+            part_ml,
+            alpha,
+            beta,
+            feat,
+            logits,
+        ] = scratch_bytes(c, b, slots);
         let s = Scratch {
-            x: alloc(4 * b * c.n_embd)?,
-            h: alloc(4 * b * c.n_embd)?,
-            y: alloc(4 * b * c.n_embd)?,
-            a1: alloc(4 * b * c.conv_dim().max(2 * qd).max(c.n_ff))?,
-            a2: alloc(4 * b * c.n_ff.max(c.d_inner()))?,
-            k: alloc(4 * b * kv_dim)?,
-            v: alloc(4 * b * kv_dim)?,
-            q: alloc(4 * b * qd)?,
-            o: alloc(4 * b * qd.max(c.d_inner()))?,
-            conv_out: alloc(4 * b * c.conv_dim())?,
-            part_o: alloc(4 * attn_parts(c, b) * c.head_dim)?,
-            part_ml: alloc(4 * 2 * attn_parts(c, b))?,
-            alpha: alloc(4 * b * c.ssm_v_heads)?,
-            beta: alloc(4 * b * c.ssm_v_heads)?,
-            feat: alloc(4 * b * c.n_embd)?,
-            logits: alloc(4 * slots * c.n_vocab)?,
+            x: alloc(x)?,
+            h: alloc(h)?,
+            y: alloc(y)?,
+            a1: alloc(a1)?,
+            a2: alloc(a2)?,
+            k: alloc(k)?,
+            v: alloc(v)?,
+            q: alloc(q)?,
+            o: alloc(o)?,
+            conv_out: alloc(conv_out)?,
+            part_o: alloc(part_o)?,
+            part_ml: alloc(part_ml)?,
+            alpha: alloc(alpha)?,
+            beta: alloc(beta)?,
+            feat: alloc(feat)?,
+            logits: alloc(logits)?,
         };
         let mtp = if draft > 0 {
+            let [emb, input, last, chain] = mtp_bytes(c, b);
             Some(MtpState {
                 kv: LayerState::Attention {
                     k: alloc(kv_bytes)?,
                     v: alloc(kv_bytes)?,
                 },
                 rows: 0,
-                emb: alloc(4 * b * c.n_embd)?,
-                input: alloc(4 * b * 2 * c.n_embd)?,
-                last: alloc(4 * c.n_embd)?,
-                chain: alloc(4 * c.n_embd)?,
+                emb: alloc(emb)?,
+                input: alloc(input)?,
+                last: alloc(last)?,
+                chain: alloc(chain)?,
                 head: match DraftVocab::new(c.n_vocab) {
                     Some(vocab) => {
                         let out = &e.model.output;
@@ -870,6 +1001,7 @@ impl<'e> MetalSession<'e> {
         } else {
             None
         };
+        debug_assert_eq!(bytes, memory.allocated());
         Ok(MetalSession {
             e,
             layers,
@@ -881,17 +1013,14 @@ impl<'e> MetalSession<'e> {
             verify_from: None,
             context,
             n_past: 0,
-            bytes,
+            memory,
         })
     }
 
     /// Bytes of one slot of a delta net's conv and recurrent states
     fn slot_bytes(&self) -> (usize, usize) {
-        let c = self.e.cfg();
-        (
-            4 * (c.conv_kernel - 1) * c.conv_dim(),
-            4 * c.ssm_v_heads * c.ssm_state * c.ssm_state,
-        )
+        let (conv, s) = self.e.model.shape().delta_net_state();
+        (4 * conv, 4 * s)
     }
 
     fn run(&mut self, tokens: &[TokenId], pass: Pass) -> Vec<Vec<f32>> {
@@ -1455,8 +1584,8 @@ impl Session for MetalSession<'_> {
         self.n_past
     }
 
-    fn state_bytes(&self) -> usize {
-        self.bytes
+    fn memory(&self) -> SessionMemory {
+        self.memory
     }
 
     fn snapshot(&self) -> Result<Snapshot, Error> {
