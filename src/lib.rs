@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::{fmt, io};
 
 use biv::gguf::{Gguf, Shard};
+use biv::tokenizer::Tokenizer;
 use memmap2::Mmap;
 
 pub mod fingerprint;
@@ -58,21 +59,35 @@ fn shard_paths(path: &Path) -> Vec<PathBuf> {
     vec![path.to_path_buf()]
 }
 
+fn map(path: &Path) -> Result<Mmap, Error> {
+    let io = |source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let file = File::open(path).map_err(io)?;
+    // SAFETY: the model files are read-only for the lifetime of the process
+    unsafe { Mmap::map(&file) }.map_err(io)
+}
+
 /// Map a GGUF file, and the other shards of a split one
 pub fn open_gguf(path: impl AsRef<Path>) -> Result<Gguf, Error> {
     let path = path.as_ref();
     let mut shards: Vec<Shard> = Vec::new();
     for p in shard_paths(path) {
-        let io = |source| Error::Io {
-            path: p.clone(),
-            source,
-        };
-        let file = File::open(&p).map_err(io)?;
-        // SAFETY: the model files are read-only for the lifetime of the process
-        let map = unsafe { Mmap::map(&file) }.map_err(io)?;
-        shards.push(Box::new(map));
+        shards.push(Box::new(map(&p)?));
     }
     Gguf::from_shards(shards).map_err(|source| Error::Gguf {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// The tokenizer of a GGUF file, without the model: only the metadata at the
+/// start of the first shard is read from disk, not the tensors
+pub fn open_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer, Error> {
+    let path = path.as_ref();
+    let first = shard_paths(path).swap_remove(0);
+    Tokenizer::from_gguf_bytes(&map(&first)?).map_err(|source| Error::Gguf {
         path: path.to_path_buf(),
         source,
     })

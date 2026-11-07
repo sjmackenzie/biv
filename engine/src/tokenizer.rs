@@ -6,7 +6,7 @@ use core::cmp::Ordering;
 use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
 
 use crate::Error;
-use crate::gguf::{Gguf, need};
+use crate::gguf::{Gguf, Metadata, need, read_metadata};
 use crate::prelude::*;
 
 const TOKEN_TYPE_CONTROL: i64 = 3;
@@ -254,7 +254,18 @@ fn byte_to_unicode() -> [char; 256] {
 
 impl Tokenizer {
     pub fn from_gguf(gguf: &Gguf) -> Result<Self, Error> {
-        let m = &gguf.metadata;
+        Self::from_metadata(&gguf.metadata)
+    }
+
+    /// The tokenizer of a GGUF file, from its first bytes: only its metadata
+    /// is parsed, and of it only the `tokenizer.*` keys are read. The tensor
+    /// table and data, and the other shards of a split file, are not needed.
+    pub fn from_gguf_bytes(buf: &[u8]) -> Result<Self, Error> {
+        let m = read_metadata(buf, |key| key.starts_with("tokenizer."))?;
+        Self::from_metadata(&m)
+    }
+
+    pub fn from_metadata(m: &Metadata) -> Result<Self, Error> {
         let ggml = &m.tokenizer.ggml;
         let model = need!(m, tokenizer.ggml.model)?;
         let pre = ggml.pre.as_deref().unwrap_or("qwen35");

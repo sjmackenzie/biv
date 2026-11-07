@@ -1,9 +1,7 @@
-use biv::tokenizer::Tokenizer;
 fn main() {
     let path = std::env::args().nth(1).unwrap();
-    let g = biv_cli::open_gguf(&path).unwrap();
     let t = std::time::Instant::now();
-    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let tok = biv_cli::open_tokenizer(&path).unwrap();
     eprintln!(
         "load {:?}, vocab {}, eos {} {:?}, eog {:?}",
         t.elapsed(),
