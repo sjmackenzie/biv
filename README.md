@@ -346,6 +346,10 @@ chats, `ChatOptions::draft` at 0 or 1 is faster.
   drafts and on the CPU. Verify logits differ from those of single-token passes
   by at most 2e-4 below 2k positions, 7e-4 above (f16 queries in the split
   flash kernel).
+- `examples/lookup.rs <gguf> [--cpu] [-n tokens] [-l lookup]`: greedy answers
+  that copy from the prompt are the same text with and without lookup, with
+  the engine's drafts and without, alone and in a batch; on a model without
+  MTP head too, whose sessions keep the room to verify the proposals.
 - `examples/compare.rs <gguf> [repeat]`: Metal vs CPU logits on the same prompt,
   then decode steps. The top-1 token matches at every step. Max logit differences
   are 0.2–0.4 on short prompts and up to a few units in the tail at ~700 tokens

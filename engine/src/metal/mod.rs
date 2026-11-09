@@ -1122,33 +1122,37 @@ fn mtp_bytes(c: &Config, slots: usize) -> [usize; 3] {
 }
 
 impl Shape<'_> {
-    /// Tokens drafted per step by a session asked for `draft`: a verify pass
-    /// is one chunk
+    /// Tokens a verify pass of a session asked for `draft` checks after its
+    /// first, a verify pass being one chunk: the MTP head's drafts, or the
+    /// proposals from the conversation (lookup), which need the room on a
+    /// model without MTP head too
     fn metal_draft(&self, draft: usize, max_batch: usize) -> usize {
-        if self.has_mtp {
-            draft.min(max_batch.max(1) - 1)
-        } else {
-            0
-        }
+        draft.min(max_batch.max(1) - 1)
+    }
+
+    /// Whether a session asked for `draft` drafts with the MTP head: its
+    /// state, kv cache and draft vocabulary
+    fn metal_mtp(&self, draft: usize, max_batch: usize) -> bool {
+        self.has_mtp && self.metal_draft(draft, max_batch) > 0
     }
 
     /// What a [`Seq`] allocates, in whole pages as the device does: a
     /// session's memory but its scratch
     fn metal_seq(&self, context: usize, draft: usize, max_batch: usize) -> SessionMemory {
         let c = self.cfg;
-        let draft = self.metal_draft(draft, max_batch);
-        let slots = draft + 1;
-        let attention = self.attention_layers() + (draft > 0) as usize;
+        let mtp = self.metal_mtp(draft, max_batch);
+        let slots = self.metal_draft(draft, max_batch) + 1;
+        let attention = self.attention_layers() + mtp as usize;
         let (conv, s) = self.delta_net_state();
         SessionMemory {
             kv: attention * 2 * pages(kv_bytes(context, self.kv_dim())),
             recurrent: self.delta_net_layers() * (pages(slots * 4 * conv) + pages(slots * 4 * s)),
-            draft_head: if draft > 0 && self.draft_head() > 0 {
+            draft_head: if mtp && self.draft_head() > 0 {
                 pages(self.draft_head())
             } else {
                 0
             },
-            scratch: if draft > 0 {
+            scratch: if mtp {
                 mtp_bytes(c, slots).map(pages).iter().sum()
             } else {
                 0
@@ -1183,9 +1187,9 @@ impl Shape<'_> {
     ) -> SessionMemory {
         let b = max_batch.max(1);
         let seq = self.metal_seq(context, draft, b);
-        let draft = self.metal_draft(draft, b);
+        let slots = self.metal_draft(draft, b) + 1;
         SessionMemory {
-            scratch: seq.scratch + self.metal_scratch(b, draft + 1, draft > 0),
+            scratch: seq.scratch + self.metal_scratch(b, slots, self.metal_mtp(draft, b)),
             ..seq
         }
     }
@@ -1289,6 +1293,7 @@ impl Seq {
         let c = e.cfg();
         let shape = e.model.shape();
         let memory = shape.metal_seq(context, draft, max_batch);
+        let mtp = shape.metal_mtp(draft, max_batch);
         let draft = shape.metal_draft(draft, max_batch);
         let slots = draft + 1;
         let kv_bytes = kv_bytes(context, shape.kv_dim());
@@ -1311,7 +1316,7 @@ impl Seq {
                 }
             });
         }
-        let mtp = if draft > 0 {
+        let mtp = if mtp {
             let [last, chain, verified] = mtp_bytes(c, slots);
             Some(MtpState {
                 kv: LayerState::Attention {
