@@ -9,6 +9,7 @@ use biv::gguf::{Gguf, Shard};
 use biv::tokenizer::Tokenizer;
 use memmap2::Mmap;
 
+pub mod bench;
 pub mod fingerprint;
 pub mod hf;
 

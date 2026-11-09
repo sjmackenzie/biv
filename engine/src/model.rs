@@ -15,7 +15,7 @@
 //! the proposals through the trunk and [`Model::keep`] drops the rejected ones.
 
 use crate::Error;
-use crate::engine::DraftLogits;
+use crate::engine::{DraftLogits, Pass};
 use crate::gguf::{Gguf, TensorInfo, need, tensor};
 #[cfg(not(any(feature = "std", test)))]
 use crate::math::Float;
@@ -1123,16 +1123,6 @@ fn dense_ffn(gate: &Weight<'_>, up: &Weight<'_>, down: &Weight<'_>, input: &Inpu
         .zip(u.par_iter())
         .for_each(|(g, u)| *g = ops::silu(*g) * u);
     matmul_new(down, &Input::new(&g, input.n))
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Pass {
-    /// no logits
-    Prefill,
-    /// logits of the last token
-    Forward,
-    /// logits of every token, and the states to go back to any of them
-    Verify,
 }
 
 enum LayerState {

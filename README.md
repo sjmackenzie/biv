@@ -120,6 +120,46 @@ output row is computed whole by one thread, so the thread count changes nothing
 bits (`-b 16` splits the probe's passes of 64), and so does the backend: CPU and
 Metal logits differ by up to about 0.4 on this probe.
 
+## Benchmark
+
+`biv bench [options] [--exact]` measures greedy decode with 0, 1 and 4 MTP
+drafts per step, and 1 then 4 chats sharing passes ([batching](#batching)). It
+takes the chat's `-m`, `--cpu`, `-t` and `-b`, and runs in 45s for the 27B on an
+M2 Max (18s for the 35B-A3B). `--exact` takes more answers, 0 to 6 drafts, a
+sampled row (temperature 1, seed 1), and 1 to 8 chats with 0 or 1 draft, in under
+3 minutes. The rows give the decode rate and the speedup over the first row;
+with drafts, the share of drafts kept and the tokens per step; with chats, the
+rate of all of them together, prompts included.
+
+Greedy, drafting must not change the text: `same text` counts the answers equal
+to those without drafts, and any difference makes `bench` exit with 1. Batched
+answers can differ from the first row's by rounding (see [batching](#batching)),
+so `same answers` only counts them.
+
+```
+$ biv bench --exact
+exact: 3 prompts x 128 tokens, greedy
+drafts          decode  speedup  accepted  tok/step  same text
+0           18.4 tok/s    1.00x         -      1.00  -
+1           26.5 tok/s    1.44x       86%      1.85  3/3
+2           24.9 tok/s    1.35x       75%      2.48  3/3
+4           28.5 tok/s    1.54x       56%      3.20  3/3
+6           28.2 tok/s    1.53x       43%      3.49  3/3
+4 sampled   26.8 tok/s    1.45x       51%      3.00  -
+
+batching: 8 prompts x 40 tokens, greedy, each chat taking the next prompt when done
+chats  drafts         tok/s  speedup  same answers
+    1       0    16.1 tok/s    1.00x  -
+    2       0    24.6 tok/s    1.53x  8/8
+    4       0    32.9 tok/s    2.04x  8/8
+    8       0    53.1 tok/s    3.30x  8/8
+    4       1    37.9 tok/s    2.36x  8/8
+    8       1    43.4 tok/s    2.70x  8/8
+```
+
+A row is one run, so rates move by a few percent between runs (more when the
+machine is warm or busy).
+
 ## Layout
 
 Two crates: `biv` (`engine/`) is the inference engine, with no I/O, and
@@ -146,8 +186,9 @@ time either way (cpuid). Its features:
 | `engine/src/math.rs` | libm float functions without `std` |
 | `engine/src/model.rs` | the `qwen35` / `qwen35moe` graph: port of llama.cpp `src/models/qwen35.cpp`, `qwen35moe.cpp` and `delta-net-base.cpp`; expert routing; MTP drafting |
 | `engine/src/memory.rs` | memory of a model and its sessions: estimated from the GGUF alone (`Footprint`), or reported by engines and sessions |
-| `engine/src/engine.rs` | `Engine` / `Session` traits shared by the backends (draft / verify / keep for speculative decoding); CPU implementation |
-| `engine/src/metal/mod.rs` | Metal backend: no-copy weight buffers, per-session KV/recurrent state, one command buffer per forward pass |
+| `engine/src/engine.rs` | `Engine` / `Session` / `Batch` traits shared by the backends (draft / verify / keep for speculative decoding); CPU implementation; sequential batches |
+| `engine/src/batch.rs` | continuous batching: the scheduler, and the `Engine` handle whose sessions it serves |
+| `engine/src/metal/mod.rs` | Metal backend: no-copy weight buffers, per-sequence KV/recurrent state, one command buffer per forward pass of one or more sequences |
 | `engine/src/metal/kernels.metal` | matvec / simdgroup matmul for each quant type (from ggml-metal), fused norm, rope, split-K (decode) and flash (prefill) attention, conv and gated delta-net kernels, expert routing and the matmul / matvec over each expert's tokens |
 | `engine/src/tokenizer.rs` | byte-level BPE; the `qwen35` pre-tokenizer regex, matched by hand |
 | `engine/src/chat.rs` | chat template (ChatML with `<think>`), incremental multi-turn state, the speculative decoding loop |
@@ -156,6 +197,7 @@ time either way (cpuid). Its features:
 | `src/lib.rs` | GGUF files: shard discovery, mmap |
 | `src/hf.rs` | Hugging Face cache lookup |
 | `src/fingerprint.rs` | `biv fingerprint`: the stack, the probe, the comparison |
+| `src/bench.rs` | `biv bench`: decode rates with drafts and with batched chats |
 | `src/main.rs` | the chat CLI |
 | `src/bin/gguf-dump.rs` | print a GGUF's metadata and tensors |
 
@@ -232,6 +274,58 @@ its token ids in one of two encodings: `Full`, a u32 per token, or `Compact`, a
 u16 per token below 0xffff and, from 0xffff, the escape 0xffff followed by a u32
 of the id minus 0xffff (0xffff is `ff ff 00 00 00 00`).
 
+## Batching
+
+Several chats can share an engine, each on a thread of its own, with
+continuous batching: a pass takes the tokens of every chat ready for one, so
+the weights are read once for all of them. `batch::serve(engine, &opts, f)` runs
+a scheduler on the calling thread and gives `f`, run on another thread, a
+`batch::Handle`. The handle is an `Engine`: chats made on it work as on any
+engine (drafts, lookup, tools, prefixes), their sessions' calls going to the
+scheduler.
+
+Between passes the scheduler takes the requests that came. Drafts, `keep` and
+snapshots are served at once; tokens wait for the next pass, which takes the
+decode steps first (forward and verify, in their order), then pieces of
+prompts to fill the rest of the pass (`BatchOptions::tokens`, the engine's
+batch size by default; `BatchOptions::logits` caps the rows of logits). Chats
+join and leave between any two passes. After a pass the scheduler waits up to
+`BatchOptions::wait` (5 ms) for the chats it answered, so that they make the
+next pass together.
+
+Underneath, `Engine::new_batch` makes a `Batch` of sequences whose
+`Batch::run` takes the tokens of several in one pass. On Metal the
+sequences share one set of activation buffers. The matmuls, norms and
+feed-forwards run once over all the rows, and the attention, the delta nets and
+the MTP head per sequence, on its rows. A session alone is a pass of one sequence, the
+same kernels as before: the fingerprint doesn't change. The CPU backend has no
+batched pass yet: its batch runs the sequences one after another.
+
+A sequence's logits depend on the other tokens of its passes, as on how
+a prompt is split: the matmul kernels are chosen by the rows of the whole
+pass. On Qwen3.6 35B-A3B (Q8_0), decode steps of 2 to 8 sequences of one
+token each gave the logits of each alone, bit for bit; a prompt piece in a pass
+with other sequences' tokens doesn't. On the dense models the 8 answers below were the
+same text as alone. On Qwen3.6 35B-A3B 5 of 8 parted after a few hundred
+characters, the experts' router turning small differences into other experts.
+
+Throughput of 8 greedy answers of 128 tokens without thinking, `j` chats at a
+time, each taking the next prompt when done (`examples/batch.rs`, M2 Max), in
+tokens per second for all the chats together:
+
+| | alone | 2 chats | 4 chats | 8 chats |
+|---|---|---|---|---|
+| Qwen3.5 4B Q8_0 | 43.9 | 81.4 | 145.0 | 242.5 (5.5×) |
+| Qwen3.8 27B Q4_1, no draft | 17.4 | 24.4 | 35.8 | 61.9 (3.6×) |
+| Qwen3.8 27B Q4_1, 1 draft | 21.8 | | 49.4 | 54.4 |
+| Qwen3.8 27B Q4_1, 4 drafts | 23.0 | 26.1 | 31.8 | 36.3 |
+| Qwen3.6 35B-A3B Q8_0, no draft | 43.0 | | 104.3 | 143.4 (3.3×) |
+| Qwen3.6 35B-A3B Q8_0, 4 drafts | 59.2 | | | 91.1 |
+
+Drafting gains less in a batch: 8 verify passes of 5 tokens make 40 rows, in
+the `mm` kernels, and each chat's drafts are passes of their own. With many
+chats, `ChatOptions::draft` at 0 or 1 is faster.
+
 ## Verification
 
 - Kernel tests: `cargo test --workspace --release` compares every SIMD kernel
@@ -269,6 +363,12 @@ of the id minus 0xffff (0xffff is `ff ff 00 00 00 00`).
   do I/O in a temporary workspace: list a directory, read a file, wait for a
   file that a simulated build writes after 10 s. The model waits for the build,
   reads what it needs and answers; paths outside the workspace are refused.
+- `examples/batch.rs <gguf> [--cpu] [-n tokens] [-d draft] [-j chats...]`:
+  sequences run in one pass have the top-1 token they have alone; a prefix
+  saved and restored through the scheduler gives the answer of the engine
+  itself; then the throughput above, and how many answers are the text of the
+  same chat alone. Decoded together after prompts processed alone, sequences
+  have the logits they have alone, bit for bit, on Qwen3.6 35B-A3B too.
 - `examples/attention.rs <gguf> [tokens]`: Metal logits after prefilling the
   same tokens in full batches (flash attention) and in passes of 8 (split-K,
   then split flash attention past 2k positions) have the same top-1 token; over
@@ -357,6 +457,11 @@ arrays went to memory and the kernel was slower than split-K.
   once in int4. Or verify trees of drafts (several candidates per position, as
   in EAGLE), which needs a copy of the delta net states per branch.
 - A 2-row CPU dot kernel, for speculative decoding on the CPU.
+- Batched passes on the CPU: `Model` carrying several `State`s through one pass.
+- Batched drafting: the MTP head's steps of all the sequences of a batch in one
+  pass, and fewer drafts as more chats share the passes.
+- One attention dispatch for all the sequences of a pass (per-row positions
+  and caches) rather than one per sequence.
 
 ## License
 

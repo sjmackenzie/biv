@@ -13,13 +13,14 @@ use biv::gguf::Gguf;
 use biv::model::Model;
 use biv::sampler::{Sampler, SamplerConfig};
 use biv::tokenizer::Tokenizer;
-use biv_cli::{fingerprint, hf};
+use biv_cli::{bench, fingerprint, hf};
 
 const DEFAULT_MODEL: &str = "hf.co/unsloth/Qwen3.8-27B-GGUF:Q4_1";
 
 const USAGE: &str = "\
 usage: biv [options]
        biv fingerprint [options] [--check <file>]
+       biv bench [options] [--exact]
 
   -m, --model <path|name>   GGUF file, or a cached Hugging Face model as skelm
                             names it [default: hf.co/unsloth/Qwen3.8-27B-GGUF:Q4_1]
@@ -51,11 +52,19 @@ fingerprint prints, as key=value lines, what should decide the generated text
 test run on this stack. With --check, it compares them with a saved fingerprint, exiting
 with 1 when anything differs.
 
+bench prints the decode rates with MTP drafts (0 to 4 per step) and of chats
+sharing passes (continuous batching), greedy: 45s for a 27B model on an M2 Max.
+--exact runs more answers, drafts (up to 6) and chats, and a sampled row: under
+3 minutes. It exits with 1 when the text with drafts differs from the text
+without them.
+
 chat commands: /reset, /think, /nothink, /stats, /quit";
 
 struct Args {
     /// `biv fingerprint`, with the file of `--check`
     fingerprint: Option<Option<String>>,
+    /// `biv bench`, with `--exact`
+    bench: Option<bool>,
     model: String,
     prompt: Option<String>,
     threads: Option<usize>,
@@ -73,6 +82,7 @@ struct Args {
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
         fingerprint: None,
+        bench: None,
         model: DEFAULT_MODEL.to_string(),
         prompt: None,
         threads: None,
@@ -89,6 +99,8 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     if it.next_if(|a| a == "fingerprint").is_some() {
         a.fingerprint = Some(None);
+    } else if it.next_if(|a| a == "bench").is_some() {
+        a.bench = Some(false);
     }
     while let Some(flag) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -121,6 +133,7 @@ fn parse_args() -> Result<Args, String> {
             "--repeat-penalty" => a.repeat_penalty = num(&flag, val()?)?,
             "--seed" => a.seed = num(&flag, val()?)?,
             "--check" if a.fingerprint.is_some() => a.fingerprint = Some(Some(val()?)),
+            "--exact" if a.bench.is_some() => a.bench = Some(true),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -361,6 +374,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             threads,
             check.as_deref(),
         );
+    }
+    if let Some(exact) = args.bench {
+        if !bench::run(engine.as_ref(), &tok, model.has_mtp(), exact)? {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
     let mut sampler = Sampler::new(sampler_cfg);
     if let Some(device) = engine.device_memory() {
