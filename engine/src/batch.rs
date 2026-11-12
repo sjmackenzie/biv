@@ -89,6 +89,11 @@ pub fn serve<R: Send>(
             wait: opts.wait,
             queue: Vec::new(),
             answered: Vec::new(),
+            passes: Passes {
+                passes: 0,
+                shared: 0,
+                tokens: 0,
+            },
         }
         .run(rx);
         user.join()
@@ -102,6 +107,17 @@ pub fn serve<R: Send>(
 pub struct Handle {
     tx: Sender<Request>,
     info: Arc<Info>,
+}
+
+/// The passes a [`serve`] scheduler ran since it started
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Passes {
+    /// all passes
+    pub passes: u64,
+    /// the passes that held the tokens of more than one sequence
+    pub shared: u64,
+    /// the tokens of all passes
+    pub tokens: u64,
 }
 
 /// What the handle answers without asking the scheduler
@@ -155,6 +171,9 @@ enum Request {
     DeviceMemory {
         reply: Sender<Option<DeviceMemory>>,
     },
+    Passes {
+        reply: Sender<Passes>,
+    },
     Snapshot {
         seq: SeqId,
         reply: Sender<Result<Snapshot, Error>>,
@@ -188,6 +207,11 @@ impl Handle {
     /// sequences, which their sessions' [`Session::memory`] leaves out
     pub fn shared_memory(&self) -> SessionMemory {
         self.call(|reply| Request::SharedMemory { reply })
+    }
+
+    /// The passes the scheduler ran since it started
+    pub fn passes(&self) -> Passes {
+        self.call(|reply| Request::Passes { reply })
     }
 }
 
@@ -388,6 +412,7 @@ struct Scheduler<'b, 'e> {
     queue: Vec<Pending>,
     /// the sequences the last pass answered, until they send tokens again
     answered: Vec<SeqId>,
+    passes: Passes,
 }
 
 impl Scheduler<'_, '_> {
@@ -519,6 +544,9 @@ impl Scheduler<'_, '_> {
             Request::DeviceMemory { reply } => {
                 let _ = reply.send(self.engine.device_memory());
             }
+            Request::Passes { reply } => {
+                let _ = reply.send(self.passes);
+            }
             Request::Snapshot { seq, reply } => {
                 let _ = reply.send(b.snapshot(seq));
             }
@@ -595,6 +623,13 @@ impl Scheduler<'_, '_> {
             })
             .collect();
         let out = self.batch.run(&work);
+        // a sequence has at most one request in the queue, so each piece is
+        // the tokens of another sequence
+        self.passes.passes += 1;
+        if pieces.len() > 1 {
+            self.passes.shared += 1;
+        }
+        self.passes.tokens += pieces.iter().map(|p| p.len as u64).sum::<u64>();
 
         let mut finished = Vec::new();
         for (piece, logits) in pieces.iter().zip(out) {
