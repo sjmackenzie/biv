@@ -69,6 +69,10 @@ pub enum Error {
     /// The token mask of the sampler allows no token, so no token can
     /// come next
     MaskAllowsNoToken,
+    /// A turn is open: step it to its end or cancel it first
+    TurnOpen,
+    /// No turn is open to step or cancel
+    NoTurn,
     /// A transcript that can't be read, or restored in this chat
     Transcript(&'static str),
     /// The GPU backend failed: no device, shader compilation, ...
@@ -122,6 +126,8 @@ impl fmt::Display for Error {
             Error::ZeroSeed => f.write_str("sampler seed 0: name a seed"),
             Error::ZeroRngState => f.write_str("sampler state 0: not a state of the generator"),
             Error::MaskAllowsNoToken => f.write_str("sampler: the token mask allows no token"),
+            Error::TurnOpen => f.write_str("chat: a turn is open"),
+            Error::NoTurn => f.write_str("chat: no turn is open"),
             Error::Transcript(why) => write!(f, "invalid transcript: {why}"),
             Error::Backend(msg) => f.write_str(msg),
         }

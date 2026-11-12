@@ -7,6 +7,12 @@
 //! also suits the recurrent layers, whose state cannot be rewound (beyond the
 //! last verify pass of speculative decoding).
 //!
+//! A turn runs to its end in [`Chat::send`], or one pass of the model at a
+//! time: [`Chat::begin`] opens it, each [`Chat::step`] does one pass and gives
+//! the tokens chosen after it, and [`Chat::cancel`] ends it between two steps.
+//! A caller that runs the model on its own schedule asks for the next pass
+//! only when it has taken the tokens of the last one.
+//!
 //! With tools, the model may answer with function calls ([`Event::ToolCall`]),
 //! whose results go back with [`Chat::send_tool_responses`].
 //!
@@ -189,7 +195,8 @@ pub enum Stop {
     MaxTokens,
     /// the session reached the end of the context
     ContextFull,
-    /// the `stop` function of the caller asked for the end
+    /// the caller ended the turn: [`Chat::cancel`], or the `stop` function
+    /// of [`Chat::send`]
     Cancel,
 }
 
@@ -211,6 +218,62 @@ pub struct TurnStats {
     /// the tokens sampled for the answer, in order, the end marker included
     /// when the model wrote it
     pub tokens: Vec<TokenId>,
+}
+
+/// What one [`Chat::step`] did
+#[derive(Debug, Clone)]
+pub enum Step {
+    /// a pass over a part of the prompt; more of it is left
+    Prompt,
+    /// the tokens chosen after the pass, in order; the turn goes on
+    Tokens(Vec<TokenId>),
+    /// the tokens chosen after the last pass, in order, and the end of the
+    /// turn
+    Done(Vec<TokenId>, TurnStats),
+}
+
+/// An open turn: the state between two steps
+struct Turn {
+    stats: TurnStats,
+    phase: Phase,
+}
+
+enum Phase {
+    /// the prompt, of which `done` tokens are processed; it starts with the
+    /// `pending` tokens that the chat held before the turn
+    Prompt {
+        prompt: Vec<TokenId>,
+        done: usize,
+        pending: usize,
+    },
+    /// the answer, with `next` chosen and not yet processed
+    Answer { answer: Answer, next: TokenId },
+}
+
+/// The state of an answer between two steps
+struct Answer {
+    thinking: bool,
+    decoder: StreamDecoder,
+    /// the template puts "\n\n" after </think>: don't echo it
+    skip_leading_newlines: bool,
+    /// newlines at the end of the text so far, shown only if more follows
+    held_newlines: String,
+    /// the text of the function call being generated
+    call: Option<String>,
+    spec: Speculation,
+}
+
+impl Answer {
+    fn new(thinking: bool) -> Self {
+        Answer {
+            thinking,
+            decoder: StreamDecoder::default(),
+            skip_leading_newlines: !thinking,
+            held_newlines: String::new(),
+            call: None,
+            spec: Speculation::default(),
+        }
+    }
 }
 
 /// A conversation up to some point, see [`Chat::save`]
@@ -246,7 +309,8 @@ pub struct Chat<'m> {
     tok: &'m Tokenizer,
     pub opts: ChatOptions,
     session: Box<dyn Session + 'm>,
-    /// generated but not yet processed tokens, fed before the next prompt
+    /// tokens not yet processed, fed before the next prompt: the end of the
+    /// last answer, or the rest of a cancelled prompt
     pending: Vec<TokenId>,
     /// every generated token, for the sampler penalties
     generated: Vec<TokenId>,
@@ -254,6 +318,8 @@ pub struct Chat<'m> {
     history: Vec<TokenId>,
     /// consecutive steps whose proposal from the conversation was all right
     lookup_run: usize,
+    /// the turn between [`Chat::begin`] and its end
+    turn: Option<Turn>,
     im_end: TokenId,
     think_end: TokenId,
     tool_call: TokenId,
@@ -317,6 +383,7 @@ impl<'m> Chat<'m> {
             generated,
             history,
             lookup_run: 0,
+            turn: None,
             im_end: id("<|im_end|>")?,
             think_end: id("</think>")?,
             tool_call: id("<tool_call>")?,
@@ -334,6 +401,7 @@ impl<'m> Chat<'m> {
         self.generated.clear();
         self.history.clear();
         self.lookup_run = 0;
+        self.turn = None;
         Ok(())
     }
 
@@ -374,6 +442,7 @@ impl<'m> Chat<'m> {
     /// another on the same engine. Before the first message, the system prompt
     /// is processed now, so that the prefix holds it.
     pub fn save(&mut self) -> Result<Prefix, Error> {
+        self.no_turn()?;
         if self.session.n_past() == 0 {
             let mut parts = Vec::new();
             self.system_block(&mut parts);
@@ -400,6 +469,7 @@ impl<'m> Chat<'m> {
     /// instructions and tools are those of the chat that saved it, whatever
     /// `opts` says.
     pub fn restore(&mut self, prefix: &Prefix) -> Result<(), Error> {
+        self.no_turn()?;
         self.session.restore(&prefix.snapshot)?;
         self.pending.clone_from(&prefix.pending);
         self.generated.clone_from(&prefix.generated);
@@ -435,6 +505,7 @@ impl<'m> Chat<'m> {
     /// that made it up to rounding: its tokens were processed in other
     /// passes. Nothing changes when it doesn't fit.
     pub fn restore_transcript(&mut self, transcript: &Transcript) -> Result<(), Error> {
+        self.no_turn()?;
         let Transcript {
             tokens,
             pending,
@@ -474,19 +545,30 @@ impl<'m> Chat<'m> {
         Ok(())
     }
 
+    /// Fails with [`Error::TurnOpen`] while a turn is open
+    fn no_turn(&self) -> Result<(), Error> {
+        match self.turn {
+            Some(_) => Err(Error::TurnOpen),
+            None => Ok(()),
+        }
+    }
+
     /// Tokens drafted by the MTP head per step
     fn draft(&self) -> usize {
         self.opts.draft.unwrap_or_else(|| self.engine.draft_size())
     }
 
-    /// Append `tokens` to the sequence, in passes of the batch size
-    fn prefill(&mut self, tokens: &[TokenId]) {
-        let batch = self
-            .opts
+    /// Prompt tokens processed per pass
+    fn batch(&self) -> usize {
+        self.opts
             .batch
             .unwrap_or_else(|| self.engine.batch_size())
-            .max(1);
-        for chunk in tokens.chunks(batch) {
+            .max(1)
+    }
+
+    /// Append `tokens` to the sequence, in passes of the batch size
+    fn prefill(&mut self, tokens: &[TokenId]) {
+        for chunk in tokens.chunks(self.batch()) {
             self.session.prefill(chunk);
         }
     }
@@ -555,7 +637,8 @@ impl<'m> Chat<'m> {
     }
 
     /// Send a user message and stream the answer through `on_event`.
-    /// `stop` is polled between tokens to interrupt the generation.
+    /// `stop` is polled between the steps of the answer ([`Chat::step`]) to
+    /// interrupt the generation.
     pub fn send(
         &mut self,
         user: &str,
@@ -563,7 +646,8 @@ impl<'m> Chat<'m> {
         on_event: impl FnMut(Event<'_>),
         stop: impl Fn() -> bool,
     ) -> Result<TurnStats, Error> {
-        self.send_with_history(&[], user, sampler, on_event, stop)
+        self.begin(user)?;
+        self.run(sampler, on_event, stop)
     }
 
     /// Append `history`, messages of an earlier conversation that this chat
@@ -580,6 +664,33 @@ impl<'m> Chat<'m> {
         on_event: impl FnMut(Event<'_>),
         stop: impl Fn() -> bool,
     ) -> Result<TurnStats, Error> {
+        self.begin_with_history(history, user)?;
+        self.run(sampler, on_event, stop)
+    }
+
+    /// Send the results of the function calls of the last answer, in their
+    /// order, and stream the answer as [`Chat::send`] does
+    pub fn send_tool_responses(
+        &mut self,
+        responses: &[impl AsRef<str>],
+        sampler: &mut Sampler,
+        on_event: impl FnMut(Event<'_>),
+        stop: impl Fn() -> bool,
+    ) -> Result<TurnStats, Error> {
+        self.begin_tool_responses(responses)?;
+        self.run(sampler, on_event, stop)
+    }
+
+    /// Start the turn of a user message, as [`Chat::send`] does, and give the
+    /// answer to the caller one [`Chat::step`] at a time. Nothing is processed
+    /// yet. Fails with [`Error::TurnOpen`] while a turn is open, and with
+    /// [`Error::ContextFull`] when the prompt doesn't fit.
+    pub fn begin(&mut self, user: &str) -> Result<(), Error> {
+        self.begin_with_history(&[], user)
+    }
+
+    /// Start a turn as [`Chat::send_with_history`] does, to [`Chat::step`]
+    pub fn begin_with_history(&mut self, history: &[Message<'_>], user: &str) -> Result<(), Error> {
         let mut message = Vec::new();
         for m in history {
             match *m {
@@ -601,18 +712,11 @@ impl<'m> Chat<'m> {
             Template("<|im_end|>\n"),
         ]);
         let prompt = self.turn_tokens(&message);
-        self.answer(prompt, sampler, on_event, stop)
+        self.begin_prompt(prompt)
     }
 
-    /// Send the results of the function calls of the last answer, in their
-    /// order, and stream the answer as [`Chat::send`] does
-    pub fn send_tool_responses(
-        &mut self,
-        responses: &[impl AsRef<str>],
-        sampler: &mut Sampler,
-        on_event: impl FnMut(Event<'_>),
-        stop: impl Fn() -> bool,
-    ) -> Result<TurnStats, Error> {
+    /// Start a turn as [`Chat::send_tool_responses`] does, to [`Chat::step`]
+    pub fn begin_tool_responses(&mut self, responses: &[impl AsRef<str>]) -> Result<(), Error> {
         let mut message = vec![Template("<|im_start|>user")];
         for r in responses {
             message.extend([
@@ -623,17 +727,14 @@ impl<'m> Chat<'m> {
         }
         message.push(Template("<|im_end|>\n"));
         let prompt = self.turn_tokens(&message);
-        self.answer(prompt, sampler, on_event, stop)
+        self.begin_prompt(prompt)
     }
 
-    /// Process `prompt` and generate the answer
-    fn answer(
-        &mut self,
-        prompt: Vec<TokenId>,
-        sampler: &mut Sampler,
-        mut on_event: impl FnMut(Event<'_>),
-        stop: impl Fn() -> bool,
-    ) -> Result<TurnStats, Error> {
+    /// Open the turn of `prompt`, which starts with the pending tokens
+    fn begin_prompt(&mut self, prompt: Vec<TokenId>) -> Result<(), Error> {
+        if self.turn.is_some() {
+            return Err(Error::TurnOpen);
+        }
         if self.session.n_past() + prompt.len() + CLOSE_ROOM_TOKENS > self.opts.context {
             return Err(Error::ContextFull {
                 n_past: self.session.n_past(),
@@ -641,12 +742,12 @@ impl<'m> Chat<'m> {
                 context: self.opts.context,
             });
         }
+        let pending = self.pending.len();
         self.pending.clear();
-
-        let mut stats = TurnStats {
+        let stats = TurnStats {
             prompt_tokens: prompt.len(),
             gen_tokens: 0,
-            // the loop below sets the reason at each of its two ends
+            // the step that ends the turn sets the reason
             stop: Stop::End,
             drafted: 0,
             accepted: 0,
@@ -655,30 +756,132 @@ impl<'m> Chat<'m> {
             tool_calls: Vec::new(),
             tokens: Vec::new(),
         };
-        self.history.extend_from_slice(&prompt);
-        let (body, last) = prompt.split_at(prompt.len() - 1);
-        self.prefill(body);
-        let mut logits = self.session.forward(last);
-        on_event(Event::PromptDone);
+        self.turn = Some(Turn {
+            stats,
+            phase: Phase::Prompt {
+                prompt,
+                done: 0,
+                pending,
+            },
+        });
+        Ok(())
+    }
 
-        let mut thinking = self.opts.thinking;
-        let mut decoder = StreamDecoder::default();
-        // the template puts "\n\n" after </think>: don't echo it
-        let mut skip_leading_newlines = !thinking;
-        // newlines at the end of the text so far, shown only if more follows
-        let mut held_newlines = String::new();
-        // the text of the function call being generated
-        let mut call: Option<String> = None;
-        let mut spec = Speculation::default();
+    /// Step the open turn to its end, polling `stop` after each step that
+    /// gives tokens
+    fn run(
+        &mut self,
+        sampler: &mut Sampler,
+        mut on_event: impl FnMut(Event<'_>),
+        stop: impl Fn() -> bool,
+    ) -> Result<TurnStats, Error> {
         loop {
-            let next = match self.choose(&mut logits, &spec, sampler) {
+            match self.step(sampler, &mut on_event)? {
+                Step::Done(_, stats) => return Ok(stats),
+                Step::Tokens(_) if stop() => return self.cancel(&mut on_event),
+                Step::Prompt | Step::Tokens(_) => {}
+            }
+        }
+    }
+
+    /// Do one pass of the model for the open turn: a pass over the next part
+    /// of the prompt, at most the batch size, or the pass after the last token
+    /// chosen (a forward, or a draft and its verify). Then choose the tokens
+    /// that the pass gives: one, or more when drafts are right. The events of
+    /// these tokens go to `on_event`. Give each step of a turn the same
+    /// sampler. Between two steps the caller can [`Chat::cancel`] the turn.
+    /// Fails with [`Error::NoTurn`] when no turn is open. After an error the
+    /// turn is closed, as [`Chat::send`] closes it.
+    pub fn step(
+        &mut self,
+        sampler: &mut Sampler,
+        mut on_event: impl FnMut(Event<'_>),
+    ) -> Result<Step, Error> {
+        let Turn { mut stats, phase } = self.turn.take().ok_or(Error::NoTurn)?;
+        let (answer, logits) = match phase {
+            Phase::Prompt {
+                prompt,
+                done,
+                pending,
+            } => {
+                // every token of the prompt but the last, in passes of the
+                // batch size, then a forward of the last
+                let body = prompt.len() - 1;
+                if done < body {
+                    let end = body.min(done + self.batch());
+                    self.session.prefill(&prompt[done..end]);
+                    self.history.extend_from_slice(&prompt[done..end]);
+                    self.turn = Some(Turn {
+                        stats,
+                        phase: Phase::Prompt {
+                            prompt,
+                            done: end,
+                            pending,
+                        },
+                    });
+                    return Ok(Step::Prompt);
+                }
+                let last = &prompt[body..];
+                self.history.extend_from_slice(last);
+                let logits = self.session.forward(last);
+                on_event(Event::PromptDone);
+                (Answer::new(self.opts.thinking), logits)
+            }
+            Phase::Answer { mut answer, next } => {
+                let logits = self.advance(next, &mut answer.spec, &mut stats, sampler);
+                (answer, logits)
+            }
+        };
+        self.choose_tokens(stats, answer, logits, sampler, &mut on_event)
+    }
+
+    /// End the open turn before its end, as a `stop` of [`Chat::send`] does:
+    /// the message is closed so the history stays well-formed. During the
+    /// prompt, the rest of it is processed with the next message; before the
+    /// first step, the chat is as it was before the turn. Fails with
+    /// [`Error::NoTurn`] when no turn is open.
+    pub fn cancel(&mut self, mut on_event: impl FnMut(Event<'_>)) -> Result<TurnStats, Error> {
+        let Turn { mut stats, phase } = self.turn.take().ok_or(Error::NoTurn)?;
+        stats.stop = Stop::Cancel;
+        match phase {
+            Phase::Prompt {
+                prompt,
+                done: 0,
+                pending,
+            } => self.pending.extend_from_slice(&prompt[..pending]),
+            Phase::Prompt { prompt, done, .. } => {
+                self.pending.extend_from_slice(&prompt[done..]);
+                self.close_message(self.opts.thinking, false);
+            }
+            Phase::Answer { mut answer, next } => {
+                self.close_answer(&mut answer, next, &mut on_event);
+                self.settle(&mut answer.spec);
+            }
+        }
+        Ok(stats)
+    }
+
+    /// Choose tokens from `logits`, the logits after the last pass, and from
+    /// those of its right drafts, until the next token needs a pass or the
+    /// turn ends
+    fn choose_tokens(
+        &mut self,
+        mut stats: TurnStats,
+        mut a: Answer,
+        mut logits: Vec<f32>,
+        sampler: &mut Sampler,
+        on_event: &mut impl FnMut(Event<'_>),
+    ) -> Result<Step, Error> {
+        let first = stats.tokens.len();
+        loop {
+            let next = match self.choose(&mut logits, &a.spec, sampler) {
                 Ok(next) => next,
                 Err(e) => {
                     // the tokens so far are in the session: close the
                     // message, as a stop does, so the history stays
                     // well-formed for the next turn
-                    self.close_message(thinking, call.is_some());
-                    self.settle(&mut spec);
+                    self.close_message(a.thinking, a.call.is_some());
+                    self.settle(&mut a.spec);
                     return Err(e);
                 }
             };
@@ -689,24 +892,25 @@ impl<'m> Chat<'m> {
             on_event(Event::Token(next));
 
             if next == self.im_end || self.tok.eog.contains(&next) {
-                if let Some(text) = call.take() {
+                if let Some(text) = a.call.take() {
                     on_event(Event::Answer(&format!("<tool_call>{text}")));
                 }
                 // the end marker closes the message in the history
                 self.pending.push(self.im_end);
-                break;
+                stats.stop = Stop::End;
+                return Ok(self.finish(stats, a, first));
             }
-            if next == self.think_end && thinking {
-                thinking = false;
-                skip_leading_newlines = true;
-                held_newlines.clear();
+            if next == self.think_end && a.thinking {
+                a.thinking = false;
+                a.skip_leading_newlines = true;
+                a.held_newlines.clear();
                 on_event(Event::ThinkingDone);
-            } else if next == self.tool_call && !thinking && call.is_none() {
+            } else if next == self.tool_call && !a.thinking && a.call.is_none() {
                 // the newlines before a call are not part of the answer
-                held_newlines.clear();
-                call = Some(String::new());
-            } else if next == self.tool_call_end && call.is_some() {
-                let text = call.take().unwrap_or_default();
+                a.held_newlines.clear();
+                a.call = Some(String::new());
+            } else if next == self.tool_call_end && a.call.is_some() {
+                let text = a.call.take().unwrap_or_default();
                 match ToolCall::parse(&text) {
                     Some(c) => {
                         on_event(Event::ToolCall(&c));
@@ -715,59 +919,81 @@ impl<'m> Chat<'m> {
                     // not a call after all: show it as it was written
                     None => on_event(Event::Answer(&format!("<tool_call>{text}</tool_call>"))),
                 }
-                skip_leading_newlines = true;
+                a.skip_leading_newlines = true;
             } else {
-                let mut text = decoder.push(self.tok.token_bytes(next));
-                if let Some(c) = &mut call {
+                let mut text = a.decoder.push(self.tok.token_bytes(next));
+                if let Some(c) = &mut a.call {
                     c.push_str(&text);
                 } else {
-                    if skip_leading_newlines {
+                    if a.skip_leading_newlines {
                         let trimmed = text.trim_start_matches('\n');
                         if !trimmed.is_empty() {
-                            skip_leading_newlines = false;
+                            a.skip_leading_newlines = false;
                         }
                         text = trimmed.to_string();
                     }
                     let body = text.trim_end_matches('\n');
                     if !body.is_empty() {
-                        let shown = core::mem::take(&mut held_newlines) + body;
-                        on_event(if thinking {
+                        let shown = core::mem::take(&mut a.held_newlines) + body;
+                        on_event(if a.thinking {
                             Event::Thinking(&shown)
                         } else {
                             Event::Answer(&shown)
                         });
                     }
-                    held_newlines.push_str(&text[body.len()..]);
+                    a.held_newlines.push_str(&text[body.len()..]);
                 }
             }
 
-            let full =
-                self.session.n_past() - spec.drafts.len() + CLOSE_ROOM_TOKENS >= self.opts.context;
+            let full = self.session.n_past() - a.spec.drafts.len() + CLOSE_ROOM_TOKENS
+                >= self.opts.context;
             // the first reason that holds names the end, in this order
             let reason = if stats.gen_tokens >= self.opts.max_tokens {
                 Some(Stop::MaxTokens)
             } else if full {
                 Some(Stop::ContextFull)
-            } else if stop() {
-                Some(Stop::Cancel)
             } else {
                 None
             };
             if let Some(reason) = reason {
                 stats.stop = reason;
-                // close the message so the history stays well-formed
-                self.pending.push(next);
-                let call_open = call.is_some();
-                if let Some(text) = call.take() {
-                    on_event(Event::Answer(&format!("<tool_call>{text}")));
-                }
-                self.close_message(thinking, call_open);
-                break;
+                self.close_answer(&mut a, next, on_event);
+                return Ok(self.finish(stats, a, first));
             }
-            logits = self.advance(next, &mut spec, &mut stats, sampler);
+            // a right draft has its logits already: no pass is needed
+            if a.spec.drafts.front() == Some(&next) {
+                logits = self.advance(next, &mut a.spec, &mut stats, sampler);
+                continue;
+            }
+            let tokens = stats.tokens[first..].to_vec();
+            self.turn = Some(Turn {
+                stats,
+                phase: Phase::Answer { answer: a, next },
+            });
+            return Ok(Step::Tokens(tokens));
         }
-        self.settle(&mut spec);
-        Ok(stats)
+    }
+
+    /// The last step of a turn, whose tokens start at `first` in `stats`
+    fn finish(&mut self, stats: TurnStats, mut a: Answer, first: usize) -> Step {
+        self.settle(&mut a.spec);
+        Step::Done(stats.tokens[first..].to_vec(), stats)
+    }
+
+    /// Close the answer of a stopped turn into `pending`: `next`, the last
+    /// token chosen and not yet processed, then the ends of the open blocks
+    fn close_answer(
+        &mut self,
+        a: &mut Answer,
+        next: TokenId,
+        on_event: &mut impl FnMut(Event<'_>),
+    ) {
+        self.pending.push(next);
+        let call_open = a.call.is_some();
+        if let Some(text) = a.call.take() {
+            on_event(Event::Answer(&format!("<tool_call>{text}")));
+        }
+        self.close_message(a.thinking, call_open);
     }
 
     /// Close an open message into `pending`: the end of the reasoning block
