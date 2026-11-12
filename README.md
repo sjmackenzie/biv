@@ -111,6 +111,32 @@ output row is computed whole by one thread, so the thread count changes nothing
 bits (`-b 16` splits the probe's passes of 64), and so does the backend: CPU and
 Metal logits differ by up to about 0.4 on this probe.
 
+## Server
+
+`biv serve --model <path|name> --listen <address:port> [options]` answers
+`POST /v1/chat/completions` of the OpenAI API, for clients that speak it. The
+model and the address have no default. The server has no authentication, so it
+listens on a loopback address only.
+
+```sh
+biv serve --model hf.co/unsloth/Qwen3.8-27B-GGUF:Q4_1 --listen 127.0.0.1:8181
+curl -s http://127.0.0.1:8181/v1/chat/completions -d '{"model": "hf.co/unsloth/Qwen3.8-27B-GGUF:Q4_1",
+  "max_tokens": 256, "reasoning_effort": "none",
+  "messages": [{"role": "user", "content": "Name a prime number."}]}'
+```
+
+Each request holds the whole conversation and runs on a new chat
+(`Chat::send_with_history`). The server answers one request at a time and
+refuses a request that comes while one runs (`server_busy`, HTTP 503). It takes
+`model` (the name given to `--model`), `messages` (`role` system, user or
+assistant, and `content` as a string), `max_tokens`, `reasoning_effort` (`none`,
+`low`, `medium`, `high` or `xhigh`, as the chat template takes them) and
+`stream` (`false` only). It refuses any other field by name, with HTTP 400 and
+the field in the error. The answer gives `choices[0].message.content`, the
+reasoning as `reasoning_content`, `finish_reason` (`stop`, or `length` at
+`max_tokens` or at the end of the context) and `usage`. The options of the
+command line, such as `--ctx`, `--draft` and the sampler, hold for each request.
+
 ## Layout
 
 Two crates: `biv` (`engine/`) is the inference engine, with no I/O, and
@@ -145,6 +171,7 @@ time either way (cpuid). Its features:
 | `src/lib.rs` | GGUF files: shard discovery, mmap |
 | `src/hf.rs` | Hugging Face cache lookup |
 | `src/fingerprint.rs` | `biv fingerprint`: the stack, the probe, the comparison |
+| `src/serve.rs` | `biv serve`: the chat completions route of the OpenAI API |
 | `src/main.rs` | the chat CLI |
 | `src/bin/gguf-dump.rs` | print a GGUF's metadata and tensors |
 

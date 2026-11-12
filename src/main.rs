@@ -13,13 +13,14 @@ use biv::gguf::Gguf;
 use biv::model::Model;
 use biv::sampler::{Sampler, SamplerConfig, SamplerOverrides};
 use biv::tokenizer::Tokenizer;
-use biv_cli::{fingerprint, hf};
+use biv_cli::{fingerprint, hf, serve};
 
 const DEFAULT_MODEL: &str = "hf.co/unsloth/Qwen3.8-27B-GGUF:Q4_1";
 
 const USAGE: &str = "\
 usage: biv [options]
        biv fingerprint [options] [--check <file>]
+       biv serve --model <path|name> --listen <address:port> [options]
 
   -m, --model <path|name>   GGUF file, or a cached Hugging Face model as skelm
                             names it [default: hf.co/unsloth/Qwen3.8-27B-GGUF:Q4_1]
@@ -46,6 +47,11 @@ usage: biv [options]
       --seed <n>            [default: random]
   -h, --help
 
+serve answers POST /v1/chat/completions of the OpenAI API, one request at
+a time, on a loopback address. The model and --listen are required; a request
+names the model as --model gives it. src/serve.rs lists the fields it takes;
+it refuses any other field by name.
+
 fingerprint prints, as key=value lines, what should decide the generated text
 (model files, platform, backend, the options above) and the logits of a fixed
 test run on this stack. With --check, it compares them with a saved fingerprint, exiting
@@ -56,7 +62,11 @@ chat commands: /reset, /think, /nothink, /stats, /quit";
 struct Args {
     /// `biv fingerprint`, with the file of `--check`
     fingerprint: Option<Option<String>>,
+    /// `biv serve`, with the address of `--listen`
+    serve: Option<Option<String>>,
     model: String,
+    /// whether `--model` was given: `biv serve` needs it
+    model_given: bool,
     prompt: Option<String>,
     threads: Option<usize>,
     cpu: bool,
@@ -73,7 +83,9 @@ struct Args {
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
         fingerprint: None,
+        serve: None,
         model: DEFAULT_MODEL.to_string(),
+        model_given: false,
         prompt: None,
         threads: None,
         cpu: !cfg!(target_os = "macos"),
@@ -89,6 +101,8 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     if it.next_if(|a| a == "fingerprint").is_some() {
         a.fingerprint = Some(None);
+    } else if it.next_if(|a| a == "serve").is_some() {
+        a.serve = Some(None);
     }
     while let Some(flag) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -97,7 +111,10 @@ fn parse_args() -> Result<Args, String> {
                 .map_err(|_| format!("{flag}: invalid value '{v}'"))
         }
         match flag.as_str() {
-            "-m" | "--model" => a.model = val()?,
+            "-m" | "--model" => {
+                a.model = val()?;
+                a.model_given = true;
+            }
             "-p" | "--prompt" => a.prompt = Some(val()?),
             "-s" | "--system" => a.opts.system = Some(val()?),
             "--no-think" => a.opts.thinking = false,
@@ -121,11 +138,23 @@ fn parse_args() -> Result<Args, String> {
             "--repeat-penalty" => a.repeat_penalty = num(&flag, val()?)?,
             "--seed" => a.seed = num(&flag, val()?)?,
             "--check" if a.fingerprint.is_some() => a.fingerprint = Some(Some(val()?)),
+            "--listen" if a.serve.is_some() => a.serve = Some(Some(val()?)),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
             }
             _ => return Err(format!("unknown option {flag}\n\n{USAGE}")),
+        }
+    }
+    if a.serve.is_some() {
+        if !a.model_given {
+            return Err("serve needs --model".into());
+        }
+        if a.prompt.is_some() {
+            return Err("serve answers requests, not --prompt".into());
+        }
+        if a.serve == Some(None) {
+            return Err("serve needs --listen <address:port>".into());
         }
     }
     Ok(a)
@@ -250,6 +279,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         .num_threads(threads)
         .build_global()?;
 
+    // bind before the model loads, so that a wrong address fails at once
+    let listener = match &args.serve {
+        Some(Some(address)) => Some(serve::listen(address)?),
+        _ => None,
+    };
     let path = hf::resolve(&args.model)?;
     let t0 = Instant::now();
     let gguf = biv_cli::open_gguf(&path)?;
@@ -303,6 +337,23 @@ fn run() -> Result<(), Box<dyn Error>> {
             threads,
             check.as_deref(),
         );
+    }
+    if let Some(listener) = listener {
+        eprintln!(
+            "serving {} on http://{}{}",
+            args.model,
+            listener.local_addr()?,
+            serve::ROUTE
+        );
+        let server = serve::Server {
+            engine: engine.as_ref(),
+            tok: &tok,
+            model: args.model.clone(),
+            opts,
+            sampler: sampler_cfg,
+            random_seed: args.seed == 0,
+        };
+        return Ok(server.serve(listener)?);
     }
     let mut sampler = Sampler::new(sampler_cfg);
     let mut chat = Chat::new(engine.as_ref(), &tok, opts)?;

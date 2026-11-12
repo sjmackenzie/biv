@@ -17,6 +17,7 @@ biv = { path = "engine" }
 ctrlc = "3.5.2"
 memmap2 = "0.9.12"
 rayon = "1.12.0"
+serde_json = { version = "1.0.149", default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 biv = { path = "engine", features = ["metal"] }

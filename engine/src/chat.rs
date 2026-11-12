@@ -125,6 +125,14 @@ pub enum Event<'a> {
     ToolCall(&'a ToolCall),
 }
 
+/// A message of an earlier conversation, for [`Chat::send_with_history`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Message<'a> {
+    User(&'a str),
+    /// the answer, without its reasoning
+    Assistant(&'a str),
+}
+
 /// A function call the model made
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
@@ -470,11 +478,44 @@ impl<'m> Chat<'m> {
         on_event: impl FnMut(Event<'_>),
         stop: impl Fn() -> bool,
     ) -> Result<TurnStats, Error> {
-        let prompt = self.turn_tokens(&[
+        self.send_with_history(&[], user, sampler, on_event, stop)
+    }
+
+    /// Append `history`, messages of an earlier conversation that this chat
+    /// did not generate, then send `user` as [`Chat::send`] does. The chat
+    /// template writes an earlier answer with an empty reasoning block, as it
+    /// does for an answer given without its reasoning. This is how a client
+    /// that keeps the conversation itself, and sends all of it with each
+    /// message, continues it on a new chat.
+    pub fn send_with_history(
+        &mut self,
+        history: &[Message<'_>],
+        user: &str,
+        sampler: &mut Sampler,
+        on_event: impl FnMut(Event<'_>),
+        stop: impl Fn() -> bool,
+    ) -> Result<TurnStats, Error> {
+        let mut message = Vec::new();
+        for m in history {
+            match *m {
+                Message::User(text) => message.extend([
+                    Template("<|im_start|>user\n"),
+                    Content(text.trim()),
+                    Template("<|im_end|>\n"),
+                ]),
+                Message::Assistant(text) => message.extend([
+                    Template("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+                    Content(text.trim()),
+                    Template("<|im_end|>\n"),
+                ]),
+            }
+        }
+        message.extend([
             Template("<|im_start|>user\n"),
             Content(user.trim()),
             Template("<|im_end|>\n"),
         ]);
+        let prompt = self.turn_tokens(&message);
         self.answer(prompt, sampler, on_event, stop)
     }
 

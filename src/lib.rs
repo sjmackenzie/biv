@@ -10,6 +10,7 @@ use memmap2::Mmap;
 
 pub mod fingerprint;
 pub mod hf;
+pub mod serve;
 
 /// A model file that cannot be used, and why
 #[derive(Debug)]

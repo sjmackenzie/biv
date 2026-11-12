@@ -3,14 +3,13 @@
 //! so the tests need no GPU, but they are ignored without a model file:
 //! `BIV_TEST_MODEL=<gguf> cargo test --release --test chat_close -- --ignored`
 
+mod common;
+
 use biv::Error;
 use biv::chat::{CLOSE_ROOM_TOKENS, Chat, ChatOptions, Event, Stop, TurnStats};
-use biv::engine::{DraftLogits, Engine, Session, Snapshot};
-use biv::sampler::{Sampler, SamplerConfig};
 use biv::tokenizer::{TokenId, Tokenizer};
+use common::{NO_DRAFT, Script, model_path, sampler};
 
-/// The variable that names the GGUF file
-const MODEL_ENV: &str = "BIV_TEST_MODEL";
 const MESSAGE: &str = "What time is it?";
 /// A text that the tokenizer gives as one token
 const WORD: &str = " word";
@@ -25,119 +24,9 @@ const PROBE_TOKENS: usize = 1;
 const SCRIPT_TOKENS: usize = 16;
 /// The per-answer cap, above the script, so that only the context stops a turn
 const MAX_TOKENS: usize = SCRIPT_TOKENS + 1;
-/// Prompt tokens per prefill of the scripted engine
-const SCRIPT_BATCH: usize = 64;
-/// The scripted engine drafts nothing
-const NO_DRAFT: usize = 0;
 /// The tokens that a turn generates before the context leaves only the room
 /// of the close
 const STEPS_BEFORE_THE_CLOSE: usize = 2;
-/// A greedy sampler: the one-hot logits of the script choose each token
-const GREEDY: f32 = 0.0;
-/// The logit of the scripted token; every other token has 0
-const CHOSEN_LOGIT: f32 = 1.0;
-
-fn model_path() -> String {
-    std::env::var(MODEL_ENV).unwrap_or_else(|_| panic!("{MODEL_ENV} must name a GGUF file"))
-}
-
-/// An engine whose sessions choose the tokens of `script`, in order: the
-/// logits of each forward put the next token of the script first
-struct Script {
-    tokens: Vec<TokenId>,
-    vocab: usize,
-}
-
-struct ScriptSession<'s> {
-    script: &'s Script,
-    n_past: usize,
-    forwards: usize,
-}
-
-impl Script {
-    /// A session that holds `n_past` tokens, as a replay would rebuild one
-    fn session_at(&self, n_past: usize) -> Box<dyn Session + '_> {
-        Box::new(ScriptSession {
-            script: self,
-            n_past,
-            forwards: 0,
-        })
-    }
-}
-
-impl Engine for Script {
-    fn new_session(&self, _context: usize, _draft: usize) -> Result<Box<dyn Session + '_>, Error> {
-        Ok(self.session_at(0))
-    }
-
-    fn batch_size(&self) -> usize {
-        SCRIPT_BATCH
-    }
-
-    fn draft_size(&self) -> usize {
-        NO_DRAFT
-    }
-
-    fn description(&self) -> String {
-        "script".into()
-    }
-
-    fn numerics(&self) -> Vec<(&'static str, String)> {
-        Vec::new()
-    }
-}
-
-impl Session for ScriptSession<'_> {
-    fn forward(&mut self, tokens: &[TokenId]) -> Vec<f32> {
-        self.n_past += tokens.len();
-        let token = *self
-            .script
-            .tokens
-            .get(self.forwards)
-            .expect("the script holds a token for each forward");
-        self.forwards += 1;
-        let mut logits = vec![0.0; self.script.vocab];
-        logits[token as usize] = CHOSEN_LOGIT;
-        logits
-    }
-
-    fn prefill(&mut self, tokens: &[TokenId]) {
-        self.n_past += tokens.len();
-    }
-
-    fn draft(
-        &mut self,
-        _next: TokenId,
-        _n: usize,
-        _pick: &mut dyn FnMut(&DraftLogits<'_>) -> TokenId,
-    ) -> Vec<TokenId> {
-        Vec::new()
-    }
-
-    fn verify(&mut self, _tokens: &[TokenId]) -> Vec<Vec<f32>> {
-        unreachable!("a session that drafts nothing verifies nothing")
-    }
-
-    fn keep(&mut self, _n: usize) {
-        unreachable!("a session that verifies nothing keeps nothing")
-    }
-
-    fn n_past(&self) -> usize {
-        self.n_past
-    }
-
-    fn state_bytes(&self) -> usize {
-        0
-    }
-
-    fn snapshot(&self) -> Result<Snapshot, Error> {
-        unreachable!("these tests take no snapshot")
-    }
-
-    fn restore(&mut self, _snapshot: &Snapshot) -> Result<(), Error> {
-        unreachable!("these tests restore no snapshot")
-    }
-}
 
 fn options(context: usize, thinking: bool, tools: Vec<String>) -> ChatOptions {
     ChatOptions {
@@ -150,13 +39,6 @@ fn options(context: usize, thinking: bool, tools: Vec<String>) -> ChatOptions {
         tools,
         ..ChatOptions::default()
     }
-}
-
-fn sampler() -> Sampler {
-    Sampler::new(SamplerConfig {
-        temperature: GREEDY,
-        ..SamplerConfig::default()
-    })
 }
 
 fn send(chat: &mut Chat<'_>) -> Result<TurnStats, Error> {
@@ -193,10 +75,7 @@ fn close_at_the_end_of_the_context(
     thinking: bool,
     tools: Vec<String>,
 ) -> Vec<TokenId> {
-    let engine = Script {
-        tokens: script,
-        vocab: tok.n_vocab(),
-    };
+    let engine = Script::new(script, tok.n_vocab());
     let prompt = prompt_tokens(&engine, tok, thinking, &tools);
     let context = prompt + STEPS_BEFORE_THE_CLOSE + CLOSE_ROOM_TOKENS;
     let opts = options(context, thinking, tools);
@@ -266,10 +145,7 @@ fn a_call_does_not_open_while_thinking() {
 fn a_prompt_needs_the_room_of_the_close() {
     let gguf = biv_cli::open_gguf(model_path()).expect("gguf");
     let tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
-    let engine = Script {
-        tokens: vec![word(&tok); SCRIPT_TOKENS],
-        vocab: tok.n_vocab(),
-    };
+    let engine = Script::new(vec![word(&tok); SCRIPT_TOKENS], tok.n_vocab());
     let prompt = prompt_tokens(&engine, &tok, true, &[]);
 
     let short = options(prompt + CLOSE_ROOM_TOKENS - 1, true, Vec::new());
