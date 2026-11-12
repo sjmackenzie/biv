@@ -133,4 +133,8 @@ fn a_mask_that_allows_no_token_ends_the_turn_with_a_named_error() {
     s.set_mask(Box::new(Nothing));
     let turn = chat.send(MESSAGE, &mut s, |_: Event<'_>| {}, || false);
     assert!(matches!(turn, Err(Error::MaskAllowsNoToken)));
+    let end = tok
+        .token_id("<|im_end|>")
+        .expect("the tokenizer has <|im_end|>");
+    assert_eq!(chat.pending(), [end], "the open message is closed");
 }

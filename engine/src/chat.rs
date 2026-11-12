@@ -671,7 +671,17 @@ impl<'m> Chat<'m> {
         let mut call: Option<String> = None;
         let mut spec = Speculation::default();
         loop {
-            let next = self.choose(&mut logits, &spec, sampler)?;
+            let next = match self.choose(&mut logits, &spec, sampler) {
+                Ok(next) => next,
+                Err(e) => {
+                    // the tokens so far are in the session: close the
+                    // message, as a stop does, so the history stays
+                    // well-formed for the next turn
+                    self.close_message(thinking, call.is_some());
+                    self.settle(&mut spec);
+                    return Err(e);
+                }
+            };
             stats.gen_tokens += 1;
             stats.tokens.push(next);
             self.generated.push(next);
@@ -747,20 +757,30 @@ impl<'m> Chat<'m> {
                 stats.stop = reason;
                 // close the message so the history stays well-formed
                 self.pending.push(next);
-                if thinking {
-                    self.pending.push(self.think_end);
-                }
+                let call_open = call.is_some();
                 if let Some(text) = call.take() {
                     on_event(Event::Answer(&format!("<tool_call>{text}")));
-                    self.pending.push(self.tool_call_end);
                 }
-                self.pending.push(self.im_end);
+                self.close_message(thinking, call_open);
                 break;
             }
             logits = self.advance(next, &mut spec, &mut stats, sampler);
         }
         self.settle(&mut spec);
         Ok(stats)
+    }
+
+    /// Close an open message into `pending`: the end of the reasoning block
+    /// while `thinking`, the end of a call while `call_open`, then the end of
+    /// the message
+    fn close_message(&mut self, thinking: bool, call_open: bool) {
+        if thinking {
+            self.pending.push(self.think_end);
+        }
+        if call_open {
+            self.pending.push(self.tool_call_end);
+        }
+        self.pending.push(self.im_end);
     }
 
     /// The token after the sequence, from `logits`, the logits after it. With
