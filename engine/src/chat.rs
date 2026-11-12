@@ -671,7 +671,7 @@ impl<'m> Chat<'m> {
         let mut call: Option<String> = None;
         let mut spec = Speculation::default();
         loop {
-            let next = self.choose(&mut logits, &spec, sampler);
+            let next = self.choose(&mut logits, &spec, sampler)?;
             stats.gen_tokens += 1;
             stats.tokens.push(next);
             self.generated.push(next);
@@ -769,12 +769,17 @@ impl<'m> Chat<'m> {
     /// max(p - q, 0) (speculative sampling): either way the token follows the
     /// sampler's distribution p. A draft of the likeliest token, or one from
     /// the conversation, is right when the sampled token is the same.
-    fn choose(&self, logits: &mut [f32], spec: &Speculation, sampler: &mut Sampler) -> TokenId {
+    fn choose(
+        &self,
+        logits: &mut [f32],
+        spec: &Speculation,
+        sampler: &mut Sampler,
+    ) -> Result<TokenId, Error> {
         let (Some(&draft), Some(Some(q))) = (spec.drafts.front(), spec.q.front()) else {
             return sampler.sample(logits, &self.generated);
         };
-        let p = normalized(sampler.distribution(logits, &self.generated));
-        speculative_choice(&p, q, draft, sampler)
+        let p = normalized(sampler.distribution(logits, &self.generated)?);
+        Ok(speculative_choice(&p, q, draft, sampler))
     }
 
     /// The logits after `next`: those of the last verify if `next` is its

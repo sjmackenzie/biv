@@ -8,6 +8,7 @@ mod common;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use biv::Error;
 use biv::chat::{Chat, ChatOptions, Event, Stop};
 use biv::sampler::TokenMask;
 use biv::tokenizer::{TokenId, Tokenizer};
@@ -56,6 +57,30 @@ impl TokenMask for Steps {
     }
 }
 
+/// A mask that allows no token
+struct Nothing;
+
+impl TokenMask for Nothing {
+    fn mask(&self, logits: &mut [f32]) {
+        logits.fill(f32::NEG_INFINITY);
+    }
+
+    fn advance(&mut self, _token: TokenId) {}
+}
+
+fn options() -> ChatOptions {
+    ChatOptions {
+        system: None,
+        thinking: false,
+        context: CONTEXT,
+        max_tokens: MAX_TOKENS,
+        draft: Some(NO_DRAFT),
+        lookup: LOOKUP,
+        tools: Vec::new(),
+        ..ChatOptions::default()
+    }
+}
+
 fn one(tok: &Tokenizer, text: &str) -> TokenId {
     let ids = tok.encode(text);
     assert_eq!(ids.len(), 1, "{text:?} is one token");
@@ -69,19 +94,11 @@ fn a_masked_chat_chooses_only_the_tokens_that_the_mask_allows() {
     let tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
     let offered = one(&tok, OFFERED);
     let allowed = one(&tok, ALLOWED);
-    let end = tok.token_id("<|im_end|>").expect("the tokenizer has <|im_end|>");
+    let end = tok
+        .token_id("<|im_end|>")
+        .expect("the tokenizer has <|im_end|>");
     let engine = Script::new(vec![offered; SCRIPT_TOKENS], tok.n_vocab());
-    let opts = ChatOptions {
-        system: None,
-        thinking: false,
-        context: CONTEXT,
-        max_tokens: MAX_TOKENS,
-        draft: Some(NO_DRAFT),
-        lookup: LOOKUP,
-        tools: Vec::new(),
-        ..ChatOptions::default()
-    };
-    let mut chat = Chat::new(&engine, &tok, opts).expect("chat");
+    let mut chat = Chat::new(&engine, &tok, options()).expect("chat");
     let advanced = Rc::new(RefCell::new(Vec::new()));
     let mut s = sampler();
     s.set_mask(Box::new(Steps {
@@ -96,7 +113,24 @@ fn a_masked_chat_chooses_only_the_tokens_that_the_mask_allows() {
     let mut expected = vec![allowed; ALLOWED_STEPS];
     expected.push(end);
     assert_eq!(stats.tokens, expected, "the offered token is never chosen");
-    assert_eq!(*advanced.borrow(), expected, "the mask is told each chosen token");
+    assert_eq!(
+        *advanced.borrow(),
+        expected,
+        "the mask is told each chosen token"
+    );
     assert_eq!(stats.drafted, 0, "nothing is drafted while the mask is set");
     assert!(matches!(stats.stop, Stop::End));
+}
+
+#[test]
+#[ignore = "needs a model file"]
+fn a_mask_that_allows_no_token_ends_the_turn_with_a_named_error() {
+    let gguf = biv_cli::open_gguf(model_path()).expect("gguf");
+    let tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
+    let engine = Script::new(vec![one(&tok, OFFERED); SCRIPT_TOKENS], tok.n_vocab());
+    let mut chat = Chat::new(&engine, &tok, options()).expect("chat");
+    let mut s = sampler();
+    s.set_mask(Box::new(Nothing));
+    let turn = chat.send(MESSAGE, &mut s, |_: Event<'_>| {}, || false);
+    assert!(matches!(turn, Err(Error::MaskAllowsNoToken)));
 }

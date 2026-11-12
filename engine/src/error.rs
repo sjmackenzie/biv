@@ -66,6 +66,9 @@ pub enum Error {
     ZeroSeed,
     /// A sampler state of 0, which the random generator never holds
     ZeroRngState,
+    /// The token mask of the sampler allows no token, so no token can
+    /// come next
+    MaskAllowsNoToken,
     /// A transcript that can't be read, or restored in this chat
     Transcript(&'static str),
     /// The GPU backend failed: no device, shader compilation, ...
@@ -118,6 +121,7 @@ impl fmt::Display for Error {
             Error::Snapshot(why) => write!(f, "cannot restore the snapshot: {why}"),
             Error::ZeroSeed => f.write_str("sampler seed 0: name a seed"),
             Error::ZeroRngState => f.write_str("sampler state 0: not a state of the generator"),
+            Error::MaskAllowsNoToken => f.write_str("sampler: the token mask allows no token"),
             Error::Transcript(why) => write!(f, "invalid transcript: {why}"),
             Error::Backend(msg) => f.write_str(msg),
         }

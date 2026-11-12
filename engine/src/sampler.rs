@@ -90,6 +90,15 @@ impl SamplerConfig {
 /// must follow. A caller sets it on a [`Sampler`] with
 /// [`Sampler::set_mask`]; the sampler applies it before each choice, and
 /// the chat tells it each chosen token through [`Sampler::accept`].
+///
+/// The mask sees every chosen token of the answer, the reasoning block
+/// included, so a grammar of the answer text must also allow the reasoning,
+/// or the caller turns thinking off. At a stop by `max_tokens`, by the end
+/// of the context or by the caller, the chat closes the message with
+/// `</think>`, `</tool_call>` and `<|im_end|>` as needed; those close tokens
+/// pass neither the mask nor [`Sampler::accept`]. A mask that never allows
+/// `<|im_end|>` or an end-of-generation token ends a turn only at
+/// `max_tokens` or at the end of the context.
 pub trait TokenMask {
     /// Set the logit of each token that may not come next to minus
     /// infinity. At least one token must stay allowed.
@@ -178,23 +187,30 @@ impl Sampler {
         self.cfg.temperature <= 0.0
     }
 
-    /// Pick the next token; `recent` is the generated history used by the penalties
-    pub fn sample(&mut self, logits: &mut [f32], recent: &[TokenId]) -> TokenId {
+    /// Pick the next token; `recent` is the generated history used by the
+    /// penalties. Fails with [`Error::MaskAllowsNoToken`] when a mask is set
+    /// and allows no token.
+    pub fn sample(&mut self, logits: &mut [f32], recent: &[TokenId]) -> Result<TokenId, Error> {
         self.penalize(logits, recent);
-        self.apply_mask(logits);
+        self.apply_mask(logits)?;
         if self.greedy() {
-            return argmax(logits);
+            return Ok(argmax(logits));
         }
         let cand = self.probs(enumerate(logits));
-        self.draw(&cand)
+        Ok(self.draw(&cand))
     }
 
     /// The distribution [`Sampler::sample`] draws from, as (token,
     /// probability) pairs, best first, their sum 1 or a bit less. Not greedy.
-    pub fn distribution(&self, logits: &mut [f32], recent: &[TokenId]) -> Vec<(TokenId, f32)> {
+    /// Fails with [`Error::MaskAllowsNoToken`] as [`Sampler::sample`] does.
+    pub fn distribution(
+        &self,
+        logits: &mut [f32],
+        recent: &[TokenId],
+    ) -> Result<Vec<(TokenId, f32)>, Error> {
         self.penalize(logits, recent);
-        self.apply_mask(logits);
-        self.probs(enumerate(logits))
+        self.apply_mask(logits)?;
+        Ok(self.probs(enumerate(logits)))
     }
 
     /// The distribution of (token, logit) candidates, as
@@ -218,13 +234,15 @@ impl Sampler {
 
     /// The mask, if set, over `logits`. A mask that allows no token is a
     /// fault of the mask, and no choice can follow it.
-    fn apply_mask(&self, logits: &mut [f32]) {
-        if let Some(m) = &self.mask {
-            m.mask(logits);
-            assert!(
-                logits.iter().any(|l| *l > f32::NEG_INFINITY),
-                "the token mask allows no token"
-            );
+    fn apply_mask(&self, logits: &mut [f32]) -> Result<(), Error> {
+        let Some(m) = &self.mask else {
+            return Ok(());
+        };
+        m.mask(logits);
+        if logits.iter().any(|l| *l > f32::NEG_INFINITY) {
+            Ok(())
+        } else {
+            Err(Error::MaskAllowsNoToken)
         }
     }
 
@@ -369,7 +387,9 @@ mod tests {
     }
 
     fn draws(s: &mut Sampler, n: usize) -> Vec<TokenId> {
-        (0..n).map(|_| s.sample(&mut logits(), &[])).collect()
+        (0..n)
+            .map(|_| s.sample(&mut logits(), &[]).expect("a token"))
+            .collect()
     }
 
     #[test]
@@ -509,8 +529,11 @@ mod tests {
         });
         s.set_mask(only());
         let mut l = logits();
-        assert!(!ALLOWED.contains(&argmax(&l)), "the likeliest token is forbidden");
-        let t = s.sample(&mut l, &[]);
+        assert!(
+            !ALLOWED.contains(&argmax(&l)),
+            "the likeliest token is forbidden"
+        );
+        let t = s.sample(&mut l, &[]).expect("a token");
         assert!(ALLOWED.contains(&t), "{t} is allowed");
     }
 
@@ -527,7 +550,7 @@ mod tests {
     fn the_distribution_holds_only_allowed_tokens() {
         let mut s = sampling();
         s.set_mask(only());
-        let d = s.distribution(&mut logits(), &[]);
+        let d = s.distribution(&mut logits(), &[]).expect("a distribution");
         assert!(!d.is_empty());
         for (t, p) in d {
             assert!(ALLOWED.contains(&t) || p == 0.0, "{t} has p {p}");
@@ -543,7 +566,7 @@ mod tests {
         s.set_mask(Box::new(Next { last: FIRST }));
         let mut chosen = Vec::new();
         for _ in 0..ALLOWED.len() {
-            let t = s.sample(&mut logits(), &[]);
+            let t = s.sample(&mut logits(), &[]).expect("a token");
             s.accept(t);
             chosen.push(t);
         }
@@ -562,14 +585,19 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "the token mask allows no token")]
-    fn a_mask_that_allows_no_token_is_refused() {
+    fn a_mask_that_allows_no_token_is_refused_by_name() {
         let mut s = sampling();
         s.set_mask(Box::new(Only {
             allowed: Vec::new(),
             advanced: Vec::new(),
         }));
-        s.sample(&mut logits(), &[]);
+        assert!(matches!(
+            s.sample(&mut logits(), &[]),
+            Err(Error::MaskAllowsNoToken)
+        ));
+        assert!(matches!(
+            s.distribution(&mut logits(), &[]),
+            Err(Error::MaskAllowsNoToken)
+        ));
     }
-
 }
