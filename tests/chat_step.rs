@@ -24,6 +24,17 @@ const MAX_TOKENS: usize = 6;
 const BATCH: usize = 32;
 /// A context far above any turn of these tests
 const CONTEXT: usize = 4096;
+/// Tokens drafted per step in the tests of drafts
+const DRAFT: usize = 3;
+/// The tokens of a step whose drafts are all right: the token of the pass
+/// and the tokens after each draft
+const DRAFTED_STEP_TOKENS: usize = DRAFT + 1;
+/// The answer of the tests of drafts: the one token after the prompt, then
+/// two steps of right drafts
+const DRAFTED_ANSWER_TOKENS: usize = 1 + 2 * DRAFTED_STEP_TOKENS;
+/// A text of distinct words, each one token, for a script whose drafts are
+/// right only when each token is in its place
+const DISTINCT_WORDS: &str = " one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen";
 
 fn options(thinking: bool) -> ChatOptions {
     ChatOptions {
@@ -36,6 +47,25 @@ fn options(thinking: bool) -> ChatOptions {
         lookup: 0,
         ..ChatOptions::default()
     }
+}
+
+fn drafting_options() -> ChatOptions {
+    ChatOptions {
+        max_tokens: DRAFTED_ANSWER_TOKENS,
+        draft: Some(DRAFT),
+        ..options(true)
+    }
+}
+
+/// The script of the tests of drafts: distinct tokens
+fn distinct_script(tok: &Tokenizer) -> Vec<TokenId> {
+    let script = tok.encode(DISTINCT_WORDS);
+    let mut sorted = script.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), script.len(), "the words are distinct tokens");
+    assert!(script.len() >= DRAFTED_ANSWER_TOKENS + DRAFT);
+    script
 }
 
 fn message() -> String {
@@ -224,4 +254,80 @@ fn an_open_turn_is_stepped_or_cancelled_first() {
         Err(Error::TurnOpen)
     ));
     assert!(matches!(chat.save(), Err(Error::TurnOpen)));
+}
+
+/// With right drafts, one step gives the token of its pass and the tokens of
+/// the drafts, and the turn is the turn of send
+#[test]
+#[ignore = "needs a model file"]
+fn a_step_with_right_drafts_gives_several_tokens() {
+    let gguf = biv_cli::open_gguf(model_path()).expect("gguf");
+    let tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
+    let script = distinct_script(&tok);
+
+    let sent_engine = Script::new(script.clone(), tok.n_vocab());
+    let mut sent = Chat::new(&sent_engine, &tok, drafting_options()).expect("chat");
+    let by_send = sent
+        .send(&message(), &mut sampler(), |_: Event<'_>| {}, || false)
+        .expect("turn");
+
+    let stepped_engine = Script::new(script.clone(), tok.n_vocab());
+    let mut chat = Chat::new(&stepped_engine, &tok, drafting_options()).expect("chat");
+    chat.begin(&message()).expect("begin");
+    let stepped = step_to_the_end(&mut chat);
+
+    let lengths: Vec<usize> = stepped.tokens.iter().map(Vec::len).collect();
+    assert_eq!(lengths, [1, DRAFTED_STEP_TOKENS, DRAFTED_STEP_TOKENS]);
+    assert_eq!(stepped.stats.tokens, script[..DRAFTED_ANSWER_TOKENS]);
+    assert_eq!(stepped.tokens.concat(), stepped.stats.tokens);
+    assert_eq!(stepped.stats.drafted, 2 * DRAFT);
+    assert_eq!(stepped.stats.accepted, 2 * DRAFT);
+    assert_eq!(stepped.stats.stop, Stop::MaxTokens);
+
+    assert_eq!(stepped.stats.tokens, by_send.tokens);
+    assert_eq!(*stepped_engine.fed.borrow(), *sent_engine.fed.borrow());
+    assert_eq!(chat.pending(), sent.pending());
+    assert_eq!(chat.history(), sent.history());
+    assert_eq!(chat.n_past(), sent.n_past());
+}
+
+/// A cancel between two steps of right drafts closes the message after the
+/// last token chosen. The session holds the prompt and every other token of
+/// the answer, as the history does, and the next turn starts with the close.
+#[test]
+#[ignore = "needs a model file"]
+fn a_cancel_between_steps_of_drafts_closes_the_message() {
+    let gguf = biv_cli::open_gguf(model_path()).expect("gguf");
+    let tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
+    let script = distinct_script(&tok);
+    let engine = Script::new(script.clone(), tok.n_vocab());
+    let mut chat = Chat::new(&engine, &tok, drafting_options()).expect("chat");
+    chat.begin(&message()).expect("begin");
+    let mut s = sampler();
+    let mut steps = Vec::new();
+    while steps.len() < 2 {
+        match chat.step(&mut s, |_: Event<'_>| {}).expect("step") {
+            Step::Prompt => {}
+            Step::Tokens(t) => steps.push(t),
+            Step::Done(..) => panic!("the turn ends at max_tokens, after a third step"),
+        }
+    }
+    assert_eq!(steps[1].len(), DRAFTED_STEP_TOKENS);
+    let stats = chat.cancel(|_: Event<'_>| {}).expect("cancel");
+
+    let chosen = 1 + DRAFTED_STEP_TOKENS;
+    assert_eq!(stats.stop, Stop::Cancel);
+    assert_eq!(stats.tokens, script[..chosen]);
+    let last = script[chosen - 1];
+    let close = [last, id(&tok, "</think>"), id(&tok, "<|im_end|>")];
+    assert_eq!(chat.pending(), close);
+    assert_eq!(chat.n_past(), chat.history().len());
+    assert_eq!(chat.history()[stats.prompt_tokens..], script[..chosen - 1]);
+
+    // the session goes on from the cancel: the next turn starts with the
+    // close, and its answer takes the next tokens of the script
+    let before = chat.history().len();
+    chat.send(&message(), &mut s, |_: Event<'_>| {}, || false)
+        .expect("the next turn");
+    assert_eq!(chat.history()[before..before + close.len()], close);
 }

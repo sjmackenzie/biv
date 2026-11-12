@@ -28,7 +28,9 @@ pub fn model_path() -> String {
 }
 
 /// An engine whose sessions choose the tokens of `script`, in order: the
-/// logits of each forward put the next token of the script first
+/// logits of each forward, and of each token of a verify, put the next token
+/// of the script first. Its drafts are the next tokens of the script, so
+/// each draft is right.
 pub struct Script {
     pub tokens: Vec<TokenId>,
     pub vocab: usize,
@@ -39,7 +41,10 @@ pub struct Script {
 struct ScriptSession<'s> {
     script: &'s Script,
     n_past: usize,
-    forwards: usize,
+    /// the tokens of the script that the logits gave so far
+    given: usize,
+    /// `n_past` and `given` before the last verify, until its keep
+    verified_from: Option<(usize, usize)>,
 }
 
 impl Script {
@@ -56,7 +61,8 @@ impl Script {
         Box::new(ScriptSession {
             script: self,
             n_past,
-            forwards: 0,
+            given: 0,
+            verified_from: None,
         })
     }
 }
@@ -91,19 +97,26 @@ impl Engine for Script {
     }
 }
 
+impl ScriptSession<'_> {
+    /// Logits that put the next token of the script first
+    fn next_logits(&mut self) -> Vec<f32> {
+        let token = *self
+            .script
+            .tokens
+            .get(self.given)
+            .expect("the script holds a token for each logits");
+        self.given += 1;
+        let mut logits = vec![0.0; self.script.vocab];
+        logits[token as usize] = CHOSEN_LOGIT;
+        logits
+    }
+}
+
 impl Session for ScriptSession<'_> {
     fn forward(&mut self, tokens: &[TokenId]) -> Vec<f32> {
         self.n_past += tokens.len();
         self.script.fed.borrow_mut().extend_from_slice(tokens);
-        let token = *self
-            .script
-            .tokens
-            .get(self.forwards)
-            .expect("the script holds a token for each forward");
-        self.forwards += 1;
-        let mut logits = vec![0.0; self.script.vocab];
-        logits[token as usize] = CHOSEN_LOGIT;
-        logits
+        self.next_logits()
     }
 
     fn prefill(&mut self, tokens: &[TokenId]) {
@@ -111,21 +124,28 @@ impl Session for ScriptSession<'_> {
         self.script.fed.borrow_mut().extend_from_slice(tokens);
     }
 
+    /// The `n` tokens of the script after `next`, the token of the last
+    /// logits
     fn draft(
         &mut self,
         _next: TokenId,
-        _n: usize,
+        n: usize,
         _pick: &mut dyn FnMut(&DraftLogits<'_>) -> TokenId,
     ) -> Vec<TokenId> {
-        Vec::new()
+        self.script.tokens[self.given..self.given + n].to_vec()
     }
 
-    fn verify(&mut self, _tokens: &[TokenId]) -> Vec<Vec<f32>> {
-        unreachable!("a session that drafts nothing verifies nothing")
+    fn verify(&mut self, tokens: &[TokenId]) -> Vec<Vec<f32>> {
+        self.verified_from = Some((self.n_past, self.given));
+        self.n_past += tokens.len();
+        self.script.fed.borrow_mut().extend_from_slice(tokens);
+        tokens.iter().map(|_| self.next_logits()).collect()
     }
 
-    fn keep(&mut self, _n: usize) {
-        unreachable!("a session that verifies nothing keeps nothing")
+    fn keep(&mut self, n: usize) {
+        let (n_past, given) = self.verified_from.take().expect("a keep follows a verify");
+        self.n_past = n_past + n;
+        self.given = given + n;
     }
 
     fn n_past(&self) -> usize {
