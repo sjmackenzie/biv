@@ -1,9 +1,12 @@
 //! Compute backends behind one interface: an engine holds the weights, a
-//! session holds one sequence (kv cache, recurrent states).
+//! session holds one sequence (kv cache, recurrent states), and a batch
+//! holds sequences whose passes run together.
 
+use alloc::sync::Arc;
 use core::any::Any;
 
 use crate::Error;
+use crate::memory::{DeviceMemory, ModelMemory, SessionMemory};
 use crate::model::{Model, State, StateSnapshot};
 use crate::par;
 use crate::prelude::*;
@@ -23,11 +26,254 @@ pub trait Engine {
 
     fn description(&self) -> String;
 
+    /// The memory of the model on this backend
+    fn model_memory(&self) -> ModelMemory;
+
+    /// The memory of a session [`Engine::new_session`] would make with
+    /// `context` and `draft`, without making it
+    fn session_memory(&self, context: usize, draft: usize) -> SessionMemory;
+
+    /// The memory of the device the backend computes on, when it has its own
+    /// accounting: allocated now, and its budget
+    fn device_memory(&self) -> Option<DeviceMemory> {
+        None
+    }
+
     /// What decides the numbers this backend computes, besides the code, the
     /// weights and how the tokens are batched: kernel variants, cache types,
     /// sizes, as (name, value) pairs. Equal pairs on the same code and model
     /// should give the same bits.
     fn numerics(&self) -> Vec<(&'static str, String)>;
+
+    /// Sequences whose tokens go through the model together, in passes of up
+    /// to `tokens` tokens of which up to `logits` have logits, when the
+    /// backend can: the weights are then read once for all of them. None when
+    /// it can't; [`new_batch`] then runs them one after another.
+    fn new_batch(
+        &self,
+        tokens: usize,
+        logits: usize,
+    ) -> Result<Option<Box<dyn Batch + '_>>, Error> {
+        let _ = (tokens, logits);
+        Ok(None)
+    }
+}
+
+/// [`Engine::new_batch`], or sequences run one after another when the
+/// backend doesn't batch
+pub fn new_batch<'e>(
+    engine: &'e dyn Engine,
+    tokens: usize,
+    logits: usize,
+) -> Result<Box<dyn Batch + 'e>, Error> {
+    Ok(match engine.new_batch(tokens, logits)? {
+        Some(b) => b,
+        None => Box::new(Sequential {
+            engine,
+            tokens: tokens.max(1),
+            logits: logits.max(1),
+            seqs: Vec::new(),
+        }),
+    })
+}
+
+/// What a pass computes after its tokens
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pass {
+    /// no logits ([`Session::prefill`])
+    Prefill,
+    /// logits of the last token ([`Session::forward`])
+    Forward,
+    /// logits of every token, and the states to go back to any of them
+    /// ([`Session::verify`])
+    Verify,
+}
+
+/// A sequence of a [`Batch`]
+pub type SeqId = usize;
+
+/// A sequence's part of a batched pass
+#[derive(Clone, Copy, Debug)]
+pub struct Work<'a> {
+    pub seq: SeqId,
+    pub tokens: &'a [TokenId],
+    pub pass: Pass,
+}
+
+impl Work<'_> {
+    /// Rows of logits it asks for
+    pub fn logits(&self) -> usize {
+        match self.pass {
+            Pass::Prefill => 0,
+            Pass::Forward => 1,
+            Pass::Verify => self.tokens.len(),
+        }
+    }
+}
+
+/// Sequences whose passes run together: [`Batch::run`] takes the tokens of
+/// several, and the weights are read once for all of them. Each sequence is
+/// otherwise a [`Session`], through the methods of the same names.
+///
+/// The logits of a sequence depend on the other tokens of its passes (the
+/// matmul kernels are chosen by the rows of the whole pass), by rounding.
+pub trait Batch {
+    /// A new empty sequence, as [`Engine::new_session`] makes
+    fn add(&mut self, context: usize, draft: usize) -> Result<SeqId, Error>;
+
+    /// Drop a sequence and its memory
+    fn remove(&mut self, seq: SeqId);
+
+    /// Tokens of a pass, at most
+    fn max_tokens(&self) -> usize;
+
+    /// Rows of logits of a pass, at most
+    fn max_logits(&self) -> usize;
+
+    /// Each work's tokens through its sequence, all in one pass, returning
+    /// for each work the logits its [`Pass`] asks for. A sequence appears at
+    /// most once, a verify has at most the sequence's draft length + 1 tokens
+    /// and must be followed by [`Batch::keep`]; the tokens and the logits are
+    /// within [`Batch::max_tokens`] and [`Batch::max_logits`].
+    fn run(&mut self, work: &[Work<'_>]) -> Vec<Vec<Vec<f32>>>;
+
+    /// [`Session::draft`] of `seq`, alone
+    fn draft(
+        &mut self,
+        seq: SeqId,
+        next: TokenId,
+        n: usize,
+        pick: &mut dyn FnMut(&DraftLogits<'_>) -> TokenId,
+    ) -> Vec<TokenId>;
+
+    /// [`Session::keep`]
+    fn keep(&mut self, seq: SeqId, n: usize);
+
+    /// [`Session::n_past`]
+    fn n_past(&self, seq: SeqId) -> usize;
+
+    /// [`Session::memory`], but the buffers the batch shares between its
+    /// sequences: [`Batch::memory`]
+    fn seq_memory(&self, seq: SeqId) -> SessionMemory;
+
+    /// What [`Batch::add`] would allocate, as [`Engine::session_memory`]
+    fn session_memory(&self, context: usize, draft: usize) -> SessionMemory;
+
+    /// The buffers shared by the sequences: activations, logits
+    fn memory(&self) -> SessionMemory;
+
+    /// [`Session::snapshot`]
+    fn snapshot(&self, seq: SeqId) -> Result<Snapshot, Error>;
+
+    /// [`Session::restore`]
+    fn restore(&mut self, seq: SeqId, snapshot: &Snapshot) -> Result<(), Error>;
+}
+
+/// A [`Batch`] of sessions run one after another, for backends without one
+struct Sequential<'e> {
+    engine: &'e dyn Engine,
+    tokens: usize,
+    logits: usize,
+    seqs: Vec<Option<Box<dyn Session + 'e>>>,
+}
+
+impl<'e> Sequential<'e> {
+    fn seq(&self, seq: SeqId) -> &(dyn Session + 'e) {
+        self.seqs[seq].as_deref().expect("a sequence of the batch")
+    }
+
+    fn seq_mut(&mut self, seq: SeqId) -> &mut (dyn Session + 'e) {
+        self.seqs[seq]
+            .as_deref_mut()
+            .expect("a sequence of the batch")
+    }
+}
+
+impl Batch for Sequential<'_> {
+    fn add(&mut self, context: usize, draft: usize) -> Result<SeqId, Error> {
+        let session = self.engine.new_session(context, draft)?;
+        Ok(insert(&mut self.seqs, session))
+    }
+
+    fn remove(&mut self, seq: SeqId) {
+        self.seqs[seq] = None;
+    }
+
+    fn max_tokens(&self) -> usize {
+        self.tokens
+    }
+
+    fn max_logits(&self) -> usize {
+        self.logits
+    }
+
+    fn run(&mut self, work: &[Work<'_>]) -> Vec<Vec<Vec<f32>>> {
+        work.iter()
+            .map(|w| {
+                let s = self.seq_mut(w.seq);
+                match w.pass {
+                    Pass::Prefill => {
+                        s.prefill(w.tokens);
+                        Vec::new()
+                    }
+                    Pass::Forward => vec![s.forward(w.tokens)],
+                    Pass::Verify => s.verify(w.tokens),
+                }
+            })
+            .collect()
+    }
+
+    fn draft(
+        &mut self,
+        seq: SeqId,
+        next: TokenId,
+        n: usize,
+        pick: &mut dyn FnMut(&DraftLogits<'_>) -> TokenId,
+    ) -> Vec<TokenId> {
+        self.seq_mut(seq).draft(next, n, pick)
+    }
+
+    fn keep(&mut self, seq: SeqId, n: usize) {
+        self.seq_mut(seq).keep(n)
+    }
+
+    fn n_past(&self, seq: SeqId) -> usize {
+        self.seq(seq).n_past()
+    }
+
+    fn seq_memory(&self, seq: SeqId) -> SessionMemory {
+        self.seq(seq).memory()
+    }
+
+    fn session_memory(&self, context: usize, draft: usize) -> SessionMemory {
+        self.engine.session_memory(context, draft)
+    }
+
+    fn memory(&self) -> SessionMemory {
+        SessionMemory::default()
+    }
+
+    fn snapshot(&self, seq: SeqId) -> Result<Snapshot, Error> {
+        self.seq(seq).snapshot()
+    }
+
+    fn restore(&mut self, seq: SeqId, snapshot: &Snapshot) -> Result<(), Error> {
+        self.seq_mut(seq).restore(snapshot)
+    }
+}
+
+/// Put `item` in the first free place of `slab`, returning its index
+pub(crate) fn insert<T>(slab: &mut Vec<Option<T>>, item: T) -> usize {
+    match slab.iter().position(Option::is_none) {
+        Some(i) => {
+            slab[i] = Some(item);
+            i
+        }
+        None => {
+            slab.push(Some(item));
+            slab.len() - 1
+        }
+    }
 }
 
 /// A sequence. Speculative decoding is three calls: [`Session::draft`] guesses
@@ -62,8 +308,9 @@ pub trait Session {
     /// Tokens in the sequence
     fn n_past(&self) -> usize;
 
-    /// Memory held by the sequence state
-    fn state_bytes(&self) -> usize;
+    /// The memory of the session: allocated, and [`SessionMemory::kv_used`]
+    /// with [`Session::n_past`] for the part of the kv caches in use
+    fn memory(&self) -> SessionMemory;
 
     /// A copy of the sequence, to [`Session::restore`] in sessions of the same
     /// engine. Not between [`Session::verify`] and [`Session::keep`].
@@ -108,7 +355,7 @@ impl DraftLogits<'_> {
 pub struct Snapshot {
     n_past: usize,
     bytes: usize,
-    data: Box<dyn Any + Send + Sync>,
+    data: Arc<dyn Any + Send + Sync>,
 }
 
 impl Snapshot {
@@ -116,7 +363,16 @@ impl Snapshot {
         Snapshot {
             n_past,
             bytes,
-            data: Box::new(data),
+            data: Arc::new(data),
+        }
+    }
+
+    /// The same snapshot, its data shared rather than copied
+    #[cfg(feature = "std")]
+    pub(crate) fn share(&self) -> Snapshot {
+        Snapshot {
+            data: Arc::clone(&self.data),
+            ..*self
         }
     }
 
@@ -154,8 +410,28 @@ impl<T: Engine + ?Sized> Engine for &T {
         (**self).description()
     }
 
+    fn model_memory(&self) -> ModelMemory {
+        (**self).model_memory()
+    }
+
+    fn session_memory(&self, context: usize, draft: usize) -> SessionMemory {
+        (**self).session_memory(context, draft)
+    }
+
+    fn device_memory(&self) -> Option<DeviceMemory> {
+        (**self).device_memory()
+    }
+
     fn numerics(&self) -> Vec<(&'static str, String)> {
         (**self).numerics()
+    }
+
+    fn new_batch(
+        &self,
+        tokens: usize,
+        logits: usize,
+    ) -> Result<Option<Box<dyn Batch + '_>>, Error> {
+        (**self).new_batch(tokens, logits)
     }
 }
 
@@ -179,6 +455,14 @@ impl Engine for Model<'_> {
 
     fn description(&self) -> String {
         format!("cpu, {} threads", par::threads())
+    }
+
+    fn model_memory(&self) -> ModelMemory {
+        self.memory
+    }
+
+    fn session_memory(&self, context: usize, draft: usize) -> SessionMemory {
+        self.shape().cpu_session(context, draft, self.batch_size())
     }
 
     // not the thread count: each output row is computed whole by one thread
@@ -228,8 +512,12 @@ impl Session for CpuSession<'_> {
         self.state.n_past
     }
 
-    fn state_bytes(&self) -> usize {
-        self.state.kv_bytes()
+    fn memory(&self) -> SessionMemory {
+        let estimate = self.model.session_memory(self.state.context, self.draft);
+        SessionMemory {
+            transient: estimate.transient,
+            ..self.state.memory()
+        }
     }
 
     fn snapshot(&self) -> Result<Snapshot, Error> {

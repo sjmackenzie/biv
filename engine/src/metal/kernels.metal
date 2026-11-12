@@ -1,9 +1,12 @@
-// Metal kernels for the qwen35 graph.
+// Metal kernels for the qwen35 and qwen35moe graphs.
 //
 // The quantized matvec (mv_*), the simdgroup matmul (mm) and the dequantize
 // helpers are adapted from ggml-metal (llama.cpp, MIT). The delta net kernel is
 // adapted from ggml's gated_delta_net, fused with the q/k l2 norm and the gate
-// math. The remaining kernels are written for this model.
+// math. The remaining kernels are written for this model, among them the
+// expert products over tiles of the tokens routed to the same expert, which
+// read the expert's weights once per tile: `mm_id` (the matmul, 32 tokens)
+// and `mmv_id` (the matvec, up to 8).
 
 #include <metal_stdlib>
 using namespace metal;
@@ -699,61 +702,39 @@ MMV_T("mmv_q6_K", block_q6_K)
 // threadgroup of 4 simdgroups (ggml kernel_mul_mm, no tensor API).
 // `k` must be a multiple of 32.
 
-template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
-kernel void mm(
-        constant MatArgs & args [[buffer(0)]],
-        device const char * src0 [[buffer(1)]],
-        device const char * src1 [[buffer(2)]],
-        device       char * dst  [[buffer(3)]],
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiitg [[thread_index_in_threadgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+constant constexpr int MM_NR0 = 64;
+constant constexpr int MM_NR1 = 32;
 
+// The products of a tile over the whole of `k`: `x` the weight row of this
+// thread's loads, at its first block, `y` its input row, at its first float.
+// `mc` gets the 32 rows x 16 inputs of this simdgroup.
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+inline void mm_tile(
+        int k,
+        device const block_q * x,
+        device const float * y,
+        threadgroup char * shmem,
+        ushort tiitg,
+        ushort sgitg,
+        thread simdgroup_float8x8 * mc) {
     threadgroup half * sa = (threadgroup half *)(shmem);
     threadgroup half * sb = (threadgroup half *)(shmem + 4096);
-
-    constexpr int NR0 = 64;
-    constexpr int NR1 = 32;
 
     constexpr int NK  = 32;
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
 
-    const int ne0 = args.rows;
-    const int ne1 = args.n;
-
-    const int r0 = tgpig.y*NR0;
-    const int r1 = tgpig.x*NR1;
-
-    const short nr0 = (ne0 - r0 < NR0) ? (ne0 - r0) : NR0;
-    const short nr1 = (ne1 - r1 < NR1) ? (ne1 - r1) : NR1;
-
-    // a thread shouldn't load data outside of the matrix
-    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
-    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
-
     const short il0 = (tiitg % NL0);
-
     short il = il0;
-
-    const short offset1 = il0/nl;
-
-    device const block_q * x = (device const block_q *)(src0 + args.w_row_bytes*(r0 + lr0)) + offset1;
-
-    const short iy = 8*(tiitg % NL1);
-
-    device const float * y = (device const float *)(src1 + args.x_row_bytes*(r1 + lr1) + 4*iy);
 
     simdgroup_half8x8  ma[4];
     simdgroup_half8x8  mb[2];
-    simdgroup_float8x8 mc[8];
 
     for (short i = 0; i < 8; i++){
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
 
-    for (int loop_k = 0; loop_k < args.k; loop_k += NK) {
+    for (int loop_k = 0; loop_k < k; loop_k += NK) {
         half4x4 temp_a;
         dequantize_func(x, il, temp_a);
 
@@ -815,6 +796,56 @@ kernel void mm(
             lsmb += 4*64;
         }
     }
+}
+
+// Stage the products of `mm_tile` in `shmem`: weight row r of input j at
+// j*MM_NR0 + r
+inline void mm_stage(threadgroup char * shmem, ushort sgitg, thread simdgroup_float8x8 * mc) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*MM_NR0;
+
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*MM_NR0*(i/4), MM_NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void mm(
+        constant MatArgs & args [[buffer(0)]],
+        device const char * src0 [[buffer(1)]],
+        device const char * src1 [[buffer(2)]],
+        device       char * dst  [[buffer(3)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+
+    constexpr int NR0 = MM_NR0;
+    constexpr int NR1 = MM_NR1;
+    constexpr int NL0 = 2;
+    constexpr int NL1 = 4;
+
+    const int ne0 = args.rows;
+    const int ne1 = args.n;
+
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    const short nr0 = (ne0 - r0 < NR0) ? (ne0 - r0) : NR0;
+    const short nr1 = (ne1 - r1 < NR1) ? (ne1 - r1) : NR1;
+
+    // a thread shouldn't load data outside of the matrix
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    device const block_q * x = (device const block_q *)(src0 + args.w_row_bytes*(r0 + lr0)) + (tiitg % NL0)/nl;
+    device const float * y = (device const float *)(src1 + args.x_row_bytes*(r1 + lr1) + 4*8*(tiitg % NL1));
+
+    simdgroup_float8x8 mc[8];
+    mm_tile<block_q, nl, dequantize_func>(args.k, x, y, shmem, tiitg, sgitg, mc);
 
     if (r0 + NR0 <= ne0 && r1 + NR1 <= ne1) {
         device float * C = (device float *) dst +
@@ -826,15 +857,7 @@ kernel void mm(
         }
     } else {
         // partial tile: stage in threadgroup memory, write what is inside the matrix
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
-
-        for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mm_stage(shmem, sgitg, mc);
 
         if (sgitg == 0) {
             for (int j = tiitg; j < nr1; j += NR1) {
@@ -1548,3 +1571,338 @@ kernel void gdn(
 }
 
 template [[host_name("gdn_128")]] kernel void gdn<4>(constant GdnArgs &, device const float *, device const float *, device const float *, device const float *, device const float *, device float *, device float *, uint3, uint3);
+
+// ---------------------------------------------------------------------------
+// mixture of experts. A pass of n tokens through k experts each makes n*k
+// (token, expert) pairs, pair t*k + j for the j-th expert of token t:
+// `moe_route` picks them, `moe_sort` groups them by expert into tiles, of 32
+// pairs for `mm_id` and of up to 8 for `mmv_id` (an expert's last few), which
+// multiply each tile by its expert's matrix (the weights read once per tile),
+// and `moe_combine` sums the pairs of each token.
+
+struct RouteArgs { int n_expert; int k; };
+
+// the larger of two (probability, expert), the lower expert among equals
+inline void best_of(thread float & v, thread int & i, float v2, int i2) {
+    if (v2 > v || (v2 == v && i2 < i)) {
+        v = v2;
+        i = i2;
+    }
+}
+
+// One threadgroup per token: the softmax of its router logits, its k experts
+// of highest probability, and their probabilities over their sum. `p` holds
+// the probabilities, a chosen expert's set to -1.
+kernel void moe_route(
+        constant RouteArgs & args [[buffer(0)]],
+        device const float * logits [[buffer(1)]],
+        device int   * ids     [[buffer(2)]],
+        device float * weights [[buffer(3)]],
+        threadgroup float * p [[threadgroup(0)]],
+        uint   tg   [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_position_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float red_v[32];
+    threadgroup int   red_i[32];
+    const int ne = args.n_expert;
+    const short nsg = (ntg + 31)/32;
+    device const float * l = logits + tg*ne;
+
+    float m = -INFINITY;
+    for (int i = tid; i < ne; i += ntg) {
+        m = max(m, l[i]);
+    }
+    m = simd_max(m);
+    if (lane == 0) red_v[sg] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m = red_v[0];
+    for (short s = 1; s < nsg; s++) m = max(m, red_v[s]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sum = 0.f;
+    for (int i = tid; i < ne; i += ntg) {
+        p[i] = exp(l[i] - m);
+        sum += p[i];
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) red_v[sg] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum = 0.f;
+    for (short s = 0; s < nsg; s++) sum += red_v[s];
+    const float inv = 1.f/sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = tid; i < ne; i += ntg) {
+        p[i] *= inv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float total = 0.f;
+    for (int j = 0; j < args.k; j++) {
+        float v = -2.f;
+        int   bi = ne;
+        for (int i = tid; i < ne; i += ntg) {
+            best_of(v, bi, p[i], i);
+        }
+        for (ushort o = 16; o > 0; o /= 2) {
+            best_of(v, bi, simd_shuffle_down(v, o), simd_shuffle_down(bi, o));
+        }
+        if (lane == 0) {
+            red_v[sg] = v;
+            red_i[sg] = bi;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        v = red_v[0];
+        bi = red_i[0];
+        for (short s = 1; s < nsg; s++) best_of(v, bi, red_v[s], red_i[s]);
+        total += v;
+        if (tid == 0) {
+            ids[tg*args.k + j] = bi;
+            weights[tg*args.k + j] = v;
+            p[bi] = -1.f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    }
+    if (tid == 0) {
+        const float s = 1.f/max(total, 6.103515625e-5f);
+        for (int j = 0; j < args.k; j++) {
+            weights[tg*args.k + j] *= s;
+        }
+    }
+}
+
+struct SortArgs { int n_pairs; int n_expert; int mm_min; int mv_base; };
+
+// One threadgroup: the pairs in order of expert (`order`, by pair index within
+// an expert), and the tiles of an expert's pairs, as (expert, first in
+// `order`, pairs). Tiles of 32 for `mm_id`: the full ones, and the last when
+// it has `mm_min` pairs or more; the pairs left in tiles of 8 for `mmv_id`,
+// from `tiles[mv_base]`. `n_tiles` gets the number of each. `tmp` holds
+// 4 * n_expert counters.
+kernel void moe_sort(
+        constant SortArgs & args [[buffer(0)]],
+        device const int * ids   [[buffer(1)]],
+        device uint      * order [[buffer(2)]],
+        device uint4     * tiles [[buffer(3)]],
+        device uint      * n_tiles [[buffer(4)]],
+        threadgroup uint * tmp [[threadgroup(0)]],
+        ushort tid [[thread_position_in_threadgroup]],
+        ushort ntg [[threads_per_threadgroup]]) {
+    const int ne = args.n_expert;
+    threadgroup uint * count = tmp;
+    threadgroup uint * start = tmp + ne;
+    threadgroup uint * mm0 = tmp + 2*ne;
+    threadgroup uint * mv0 = tmp + 3*ne;
+    for (int e = tid; e < ne; e += ntg) {
+        uint c = 0;
+        for (int p = 0; p < args.n_pairs; p++) {
+            c += ids[p] == e;
+        }
+        count[e] = c;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // pairs of an expert in tiles of 32 for mm_id, the rest in tiles of 8
+    const uint mm_min = args.mm_min;
+    #define MM_PAIRS(c) ((c) % 32 >= mm_min ? (c) : (c) / 32 * 32)
+    if (tid == 0) {
+        uint s = 0, tm = 0, tv = 0;
+        for (int e = 0; e < ne; e++) {
+            const uint c = count[e], m = MM_PAIRS(c);
+            start[e] = s;
+            mm0[e] = tm;
+            mv0[e] = tv;
+            s += c;
+            tm += (m + 31)/32;
+            tv += (c - m + 7)/8;
+        }
+        n_tiles[0] = tm;
+        n_tiles[1] = tv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int e = tid; e < ne; e += ntg) {
+        const uint c = count[e];
+        if (c == 0) continue;
+        uint s = start[e];
+        for (int p = 0; p < args.n_pairs; p++) {
+            if (ids[p] == e) order[s++] = p;
+        }
+        const uint m = MM_PAIRS(c);
+        for (uint i = 0; i < m; i += 32) {
+            tiles[mm0[e] + i/32] = uint4(e, start[e] + i, min(32u, m - i), 0);
+        }
+        for (uint i = m; i < c; i += 8) {
+            tiles[args.mv_base + mv0[e] + (i - m)/8] = uint4(e, start[e] + i, min(8u, c - i), 0);
+        }
+    }
+    #undef MM_PAIRS
+}
+
+struct MatIdArgs {
+    int   k;       // input width
+    int   rows;    // weight rows of an expert = output width
+    int   x_div;   // pair p reads input row p / x_div
+    int   pad;
+    ulong w_row_bytes;
+    ulong x_row_bytes;
+    ulong stride;  // bytes from an expert's matrix to the next
+};
+
+// `mmv` (one row fragment, one input fragment, 2 simdgroups, 4 spans per
+// step) over the pairs of a tile: the weights of its expert, the input rows
+// of its pairs, an output row per pair
+template<typename block_q>
+kernel void mmv_id(
+        constant MatIdArgs & args [[buffer(0)]],
+        device const char  * src0 [[buffer(1)]],
+        device const char  * src1 [[buffer(2)]],
+        device       float * dst  [[buffer(3)]],
+        device const uint  * order [[buffer(4)]],
+        device const uint4 * tiles [[buffer(5)]],
+        device const uint  * n_tiles [[buffer(6)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    if (tgpig.y >= n_tiles[0]) {
+        return;
+    }
+    const uint4 tile = tiles[tgpig.y];
+    const short qid = tiisg/4;
+    const short fm = (qid & 4) + (tiisg/2)%4;
+    const short fn = (qid & 2)*2 + (tiisg%2)*2;
+    const short U = 4;
+
+    const int r0 = (tgpig.x*2 + sgitg)*8;
+    const int nt = tile.z;
+    const int ns = args.k/32;
+    src0 += tile.x*args.stride;
+
+    device const float * y[2];
+    FOR_UNROLL (short i = 0; i < 2; i++) {
+        const uint p = order[tile.y + min(fn + i, nt - 1)];
+        y[i] = (device const float *) (src1 + (p/args.x_div)*args.x_row_bytes) + fm;
+    }
+    device const block_q * x = (device const block_q *) (src0 + min(r0 + fm, args.rows - 1)*args.w_row_bytes);
+
+    simdgroup_float8x8 c = make_filled_simdgroup_matrix<float, 8>(0.f);
+    for (int is = 0; is < ns; is += U) {
+        float2 w[U][4];
+        FOR_UNROLL (short u = 0; u < U; u++) {
+            deq_span(x, is + u, fn, w[u]);
+        }
+        FOR_UNROLL (short u = 0; u < U; u++) {
+            FOR_UNROLL (short j = 0; j < 4; j++) {
+                simdgroup_float8x8 a, b;
+                b.thread_elements()[0] = y[0][32*(is + u) + 8*j];
+                b.thread_elements()[1] = y[1][32*(is + u) + 8*j];
+                a.thread_elements()[0] = w[u][j][0];
+                a.thread_elements()[1] = w[u][j][1];
+                simdgroup_multiply_accumulate(c, a, b, c);
+            }
+        }
+    }
+
+    const int row = r0 + fm;
+    if (row < args.rows) {
+        if (fn < nt)     dst[order[tile.y + fn]*args.rows + row]     = c.thread_elements()[0];
+        if (fn + 1 < nt) dst[order[tile.y + fn + 1]*args.rows + row] = c.thread_elements()[1];
+    }
+}
+
+#define MMV_ID(name, block) \
+template [[host_name(name)]] kernel void mmv_id<block>(constant MatIdArgs &, device const char *, device const char *, device float *, device const uint *, device const uint4 *, device const uint *, uint3, ushort, ushort);
+MMV_ID("mmv_id_f32",  float4x4)
+MMV_ID("mmv_id_f16",  half4x4)
+MMV_ID("mmv_id_bf16", block_bf16)
+MMV_ID("mmv_id_q4_0", block_q4_0)
+MMV_ID("mmv_id_q4_1", block_q4_1)
+MMV_ID("mmv_id_q8_0", block_q8_0)
+MMV_ID("mmv_id_q4_K", block_q4_K)
+MMV_ID("mmv_id_q5_K", block_q5_K)
+MMV_ID("mmv_id_q6_K", block_q6_K)
+
+// `mm` over a tile of up to 32 pairs: the
+// weights of its expert, the input rows of its pairs, an output row per pair.
+// A threadgroup per tile and 64 weight rows, the tiles along x.
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void mm_id(
+        constant MatIdArgs & args [[buffer(0)]],
+        device const char  * src0 [[buffer(1)]],
+        device const char  * src1 [[buffer(2)]],
+        device       float * dst  [[buffer(3)]],
+        device const uint  * order [[buffer(4)]],
+        device const uint4 * tiles [[buffer(5)]],
+        device const uint  * n_tiles [[buffer(6)]],
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    if (tgpig.x >= n_tiles[0]) {
+        return;
+    }
+    const uint4 tile = tiles[tgpig.x];
+    constexpr int NL0 = 2;
+    constexpr int NL1 = 4;
+
+    const int ne0 = args.rows;
+    const int r0 = tgpig.y*MM_NR0;
+    const short nr0 = (ne0 - r0 < MM_NR0) ? (ne0 - r0) : MM_NR0;
+    const short nr1 = tile.z;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    device const block_q * x = (device const block_q *)(src0 + tile.x*args.stride + args.w_row_bytes*(r0 + lr0)) + (tiitg % NL0)/nl;
+    const uint p = order[tile.y + lr1];
+    device const float * y = (device const float *)(src1 + (p/args.x_div)*args.x_row_bytes + 4*8*(tiitg % NL1));
+
+    simdgroup_float8x8 mc[8];
+    mm_tile<block_q, nl, dequantize_func>(args.k, x, y, shmem, tiitg, sgitg, mc);
+    mm_stage(shmem, sgitg, mc);
+
+    // each pair's row, 64 weight rows at a time
+    threadgroup const float * C = (threadgroup const float *) shmem;
+    for (int i = tiitg; i < nr1*MM_NR0; i += 128) {
+        const int j = i/MM_NR0, r = i%MM_NR0;
+        if (r < nr0) {
+            dst[order[tile.y + j]*ne0 + r0 + r] = C[i];
+        }
+    }
+}
+
+typedef void (mm_id_t)(constant MatIdArgs &, device const char *, device const char *, device float *, device const uint *, device const uint4 *, device const uint *, threadgroup char *, uint3, ushort, ushort);
+
+template [[host_name("mm_id_f32")]]  kernel mm_id_t mm_id<float4x4,   1,     dequantize_f32>;
+template [[host_name("mm_id_f16")]]  kernel mm_id_t mm_id<half4x4,    1,     dequantize_f16>;
+template [[host_name("mm_id_bf16")]] kernel mm_id_t mm_id<block_bf16, 1,     dequantize_bf16>;
+template [[host_name("mm_id_q4_0")]] kernel mm_id_t mm_id<block_q4_0, 2,     dequantize_q4_0>;
+template [[host_name("mm_id_q4_1")]] kernel mm_id_t mm_id<block_q4_1, 2,     dequantize_q4_1>;
+template [[host_name("mm_id_q8_0")]] kernel mm_id_t mm_id<block_q8_0, 2,     dequantize_q8_0>;
+template [[host_name("mm_id_q4_K")]] kernel mm_id_t mm_id<block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("mm_id_q5_K")]] kernel mm_id_t mm_id<block_q5_K, QK_NL, dequantize_q5_K>;
+template [[host_name("mm_id_q6_K")]] kernel mm_id_t mm_id<block_q6_K, QK_NL, dequantize_q6_K>;
+
+struct CombineArgs { int n_embd; int k; int shared; };
+
+// x[t] += sum_j weights[t*k + j] * out[t*k + j] + sigmoid(gate[t]) * shared[t]
+kernel void moe_combine(
+        constant CombineArgs & args [[buffer(0)]],
+        device float       * x       [[buffer(1)]],
+        device const float * out     [[buffer(2)]],
+        device const float * weights [[buffer(3)]],
+        device const float * shared  [[buffer(4)]],
+        device const float * gate    [[buffer(5)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    const int d = gid.x, t = gid.y;
+    if (d >= args.n_embd) {
+        return;
+    }
+    float acc = 0.f;
+    for (int j = 0; j < args.k; j++) {
+        acc += weights[t*args.k + j]*out[(t*args.k + j)*args.n_embd + d];
+    }
+    if (args.shared) {
+        acc += sigmoid(gate[t])*shared[t*args.n_embd + d];
+    }
+    x[t*args.n_embd + d] += acc;
+}

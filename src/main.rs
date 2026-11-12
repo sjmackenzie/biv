@@ -13,7 +13,7 @@ use biv::gguf::Gguf;
 use biv::model::Model;
 use biv::sampler::{Sampler, SamplerConfig, SamplerOverrides};
 use biv::tokenizer::Tokenizer;
-use biv_cli::{fingerprint, hf, serve};
+use biv_cli::{bench, fingerprint, hf, serve};
 
 const DEFAULT_MODEL: &str = "hf.co/unsloth/Qwen3.8-27B-GGUF:Q4_1";
 
@@ -21,6 +21,7 @@ const USAGE: &str = "\
 usage: biv [options]
        biv fingerprint [options] [--check <file>]
        biv serve --model <path|name> --listen <address:port> [options]
+       biv bench [options] [--exact]
 
   -m, --model <path|name>   GGUF file, or a cached Hugging Face model as skelm
                             names it [default: hf.co/unsloth/Qwen3.8-27B-GGUF:Q4_1]
@@ -57,6 +58,12 @@ fingerprint prints, as key=value lines, what should decide the generated text
 test run on this stack. With --check, it compares them with a saved fingerprint, exiting
 with 1 when anything differs.
 
+bench prints the decode rates with MTP drafts (0 to 4 per step) and of chats
+sharing passes (continuous batching), greedy: 45s for a 27B model on an M2 Max.
+--exact runs more answers, drafts (up to 6) and chats, and a sampled row: under
+3 minutes. It exits with 1 when the text with drafts differs from the text
+without them.
+
 chat commands: /reset, /think, /nothink, /stats, /quit";
 
 struct Args {
@@ -64,6 +71,8 @@ struct Args {
     fingerprint: Option<Option<String>>,
     /// `biv serve`, with the address of `--listen`
     serve: Option<Option<String>>,
+    /// `biv bench`, with `--exact`
+    bench: Option<bool>,
     model: String,
     /// whether `--model` was given: `biv serve` needs it
     model_given: bool,
@@ -84,6 +93,7 @@ fn parse_args() -> Result<Args, String> {
     let mut a = Args {
         fingerprint: None,
         serve: None,
+        bench: None,
         model: DEFAULT_MODEL.to_string(),
         model_given: false,
         prompt: None,
@@ -103,6 +113,8 @@ fn parse_args() -> Result<Args, String> {
         a.fingerprint = Some(None);
     } else if it.next_if(|a| a == "serve").is_some() {
         a.serve = Some(None);
+    } else if it.next_if(|a| a == "bench").is_some() {
+        a.bench = Some(false);
     }
     while let Some(flag) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -139,6 +151,7 @@ fn parse_args() -> Result<Args, String> {
             "--seed" => a.seed = num(&flag, val()?)?,
             "--check" if a.fingerprint.is_some() => a.fingerprint = Some(Some(val()?)),
             "--listen" if a.serve.is_some() => a.serve = Some(Some(val()?)),
+            "--exact" if a.bench.is_some() => a.bench = Some(true),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -212,6 +225,60 @@ fn print_stats(s: &TurnStats, prompt_time: Duration, gen_time: Duration, style: 
         },
         style.reset()
     );
+}
+
+/// A memory size, in MB or GB
+fn size(bytes: usize) -> String {
+    match bytes as f64 {
+        b if b < 1e9 => format!("{:.1} MB", b / 1e6),
+        b => format!("{:.2} GB", b / 1e9),
+    }
+}
+
+/// The context in use and the memory of the model, the session and the device
+fn print_memory(chat: &Chat<'_>, engine: &dyn Engine) {
+    let (n, m) = (chat.n_past(), chat.memory());
+    let pct = |a: usize, b: usize| 100.0 * a as f64 / b.max(1) as f64;
+    eprintln!(
+        "{n} / {} context tokens ({:.1}%)",
+        chat.opts.context,
+        pct(n, chat.opts.context)
+    );
+    let mut parts = vec![format!("kv {} ({} in use)", size(m.kv), size(m.kv_used(n)))];
+    for (name, bytes) in [
+        ("recurrent", m.recurrent),
+        ("draft head", m.draft_head),
+        ("scratch", m.scratch),
+    ] {
+        if bytes > 0 {
+            parts.push(format!("{name} {}", size(bytes)));
+        }
+    }
+    eprintln!(
+        "session: {}: {}; up to {} more during a pass",
+        size(m.allocated()),
+        parts.join(", "),
+        size(m.transient)
+    );
+    let w = engine.model_memory();
+    eprintln!(
+        "model: {} of weights, mapped{}; {} of params",
+        size(w.weights),
+        if w.mtp_weights > 0 {
+            format!(", and {} for the MTP head", size(w.mtp_weights))
+        } else {
+            String::new()
+        },
+        size(w.params)
+    );
+    if let Some(d) = engine.device_memory() {
+        eprintln!(
+            "gpu: {} allocated, {:.0}% of the {} working set",
+            size(d.allocated),
+            pct(d.allocated, d.working_set),
+            size(d.working_set)
+        );
+    }
 }
 
 fn make_engine<'m>(
@@ -337,6 +404,24 @@ fn run() -> Result<(), Box<dyn Error>> {
             threads,
             check.as_deref(),
         );
+    }
+    if let Some(exact) = args.bench {
+        if !bench::run(engine.as_ref(), &tok, model.has_mtp(), exact)? {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if let Some(device) = engine.device_memory() {
+        let needed =
+            engine.model_memory().total() + Chat::session_memory(engine.as_ref(), &opts).peak();
+        if needed > device.working_set {
+            eprintln!(
+                "warning: the model and a {}-token context need {}, more than the {} the GPU works well with; try a smaller --ctx",
+                opts.context,
+                size(needed),
+                size(device.working_set)
+            );
+        }
     }
     if let Some(listener) = listener {
         eprintln!(
@@ -466,12 +551,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 chat.opts.thinking = msg == "/think";
                 eprintln!("thinking {}", if chat.opts.thinking { "on" } else { "off" });
             }
-            "/stats" => eprintln!(
-                "{} / {} context tokens, {:.1} MB of state",
-                chat.n_past(),
-                chat.opts.context,
-                chat.state_bytes() as f64 / 1e6
-            ),
+            "/stats" => print_memory(&chat, engine.as_ref()),
             _ if msg.starts_with('/') => eprintln!("unknown command {msg}"),
             _ => {
                 if let Err(e) = answer(&mut chat, msg, &mut sampler) {

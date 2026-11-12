@@ -172,6 +172,75 @@ impl<'a> Cursor<'a> {
             _ => return Err(Error::UnknownValueType(ty)),
         })
     }
+
+    /// Step over a value of type `ty` without building it
+    fn skip(&mut self, ty: u32) -> Result<(), Error> {
+        match ty {
+            8 => {
+                let len = self.u64()?;
+                self.skip_bytes(len)
+            }
+            9 => {
+                let elem_ty = self.u32()?;
+                let n = self.u64()?;
+                match fixed_size(elem_ty) {
+                    Some(size) => self.skip_bytes(n.checked_mul(size).ok_or(Error::Truncated)?),
+                    None => (0..n).try_for_each(|_| self.skip(elem_ty)),
+                }
+            }
+            _ => self.skip_bytes(fixed_size(ty).ok_or(Error::UnknownValueType(ty))?),
+        }
+    }
+
+    fn skip_bytes(&mut self, n: u64) -> Result<(), Error> {
+        self.take(usize::try_from(n).map_err(|_| Error::Truncated)?)
+            .map(|_| ())
+    }
+
+    /// The header, up to the key/values: their count, and the tensors'
+    fn header(&mut self) -> Result<(u64, u64), Error> {
+        if self.u32()? != GGUF_MAGIC {
+            return Err(Error::BadMagic);
+        }
+        let version = self.u32()?;
+        if version < 2 {
+            return Err(Error::UnsupportedVersion(version));
+        }
+        let n_tensors = self.u64()?;
+        let n_kv = self.u64()?;
+        Ok((n_tensors, n_kv))
+    }
+}
+
+/// The size of a value of type `ty`, for the types of a fixed size
+fn fixed_size(ty: u32) -> Option<u64> {
+    Some(match ty {
+        0 | 1 | 7 => 1,
+        2 | 3 => 2,
+        4..=6 => 4,
+        10..=12 => 8,
+        _ => return None,
+    })
+}
+
+/// The metadata of a GGUF file, from its first bytes: up to the end of the
+/// key/values, the tensor table and data are not needed. Only the keys
+/// `keep` accepts are read, the values of the others are skipped over. The
+/// keys with no field in [`Metadata`] are dropped.
+pub fn read_metadata(buf: &[u8], keep: impl Fn(&str) -> bool) -> Result<Metadata, Error> {
+    let mut c = Cursor { buf, pos: 0 };
+    let (_, n_kv) = c.header()?;
+    let mut metadata = Metadata::default();
+    for _ in 0..n_kv {
+        let key = c.string()?;
+        let ty = c.u32()?;
+        if keep(&key) && !metadata.contains(&key) {
+            let _ = metadata.set(&key, c.value(ty)?);
+        } else {
+            c.skip(ty)?;
+        }
+    }
+    Ok(metadata)
 }
 
 impl Gguf {
@@ -193,15 +262,7 @@ impl Gguf {
 
     fn parse_shard(&mut self, shard: usize, buf: &[u8]) -> Result<(), Error> {
         let mut c = Cursor { buf, pos: 0 };
-        if c.u32()? != GGUF_MAGIC {
-            return Err(Error::BadMagic);
-        }
-        let version = c.u32()?;
-        if version < 2 {
-            return Err(Error::UnsupportedVersion(version));
-        }
-        let n_tensors = c.u64()?;
-        let n_kv = c.u64()?;
+        let (n_tensors, n_kv) = c.header()?;
 
         for _ in 0..n_kv {
             let key = c.string()?;

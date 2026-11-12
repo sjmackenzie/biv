@@ -1,11 +1,12 @@
 //! GPT-2 style byte-level BPE, as stored in GGUF (`tokenizer.ggml.model = gpt2`)
 //! with the `qwen35` pre-tokenizer.
 
-use hashbrown::HashMap;
+use core::cmp::Ordering;
+
 use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
 
 use crate::Error;
-use crate::gguf::{Gguf, need};
+use crate::gguf::{Gguf, Metadata, need, read_metadata};
 use crate::prelude::*;
 
 const TOKEN_TYPE_CONTROL: i64 = 3;
@@ -28,7 +29,7 @@ pub struct Tokenizer {
     /// decoded bytes of each token
     bytes: Vec<Vec<u8>>,
     is_special: Vec<bool>,
-    token_to_id: HashMap<String, TokenId>,
+    by_text: ByText,
     merges: Merges,
     /// token id of each raw byte
     byte_tokens: [TokenId; 256],
@@ -101,6 +102,135 @@ struct Bpe {
     kept: Vec<Option<usize>>,
 }
 
+/// The order of `t` and the concatenation of `a` and `b`, without building it
+fn cmp_concat(t: &[u8], a: &[u8], b: &[u8]) -> Ordering {
+    let n = t.len().min(a.len());
+    match t[..n].cmp(&a[..n]) {
+        Ordering::Equal if t.len() < a.len() => Ordering::Less,
+        Ordering::Equal => t[a.len()..].cmp(b),
+        o => o,
+    }
+}
+
+/// The first [`PREFIX`] bytes of `a` followed by `b`, zero-padded, as a
+/// big-endian number: in the same order as the texts, ties apart
+fn prefix(a: &[u8], b: &[u8]) -> u128 {
+    let mut p = [0u8; PREFIX];
+    for (d, s) in p.iter_mut().zip(a.iter().chain(b)) {
+        *d = *s;
+    }
+    u128::from_be_bytes(p)
+}
+
+const PREFIX: usize = 16;
+
+/// A token of [`ByText`]: its id, and the [`prefix`] and length of its text
+#[derive(Clone, Copy)]
+struct Entry {
+    prefix: u128,
+    id: TokenId,
+    len: u32,
+}
+
+impl Entry {
+    /// The order of this token's text and `a` followed by `b`, whose prefix
+    /// is `p`
+    fn cmp(&self, tokens: &[String], p: u128, a: &[u8], b: &[u8]) -> Ordering {
+        self.cmp_by(p, a.len() + b.len(), || {
+            cmp_concat(tokens[self.id as usize].as_bytes(), a, b)
+        })
+    }
+
+    /// The order of this token's text and a text of prefix `p` and length
+    /// `len`, which `texts` compares to it. With the same prefix, a text of at
+    /// most [`PREFIX`] bytes is the start of the other one, so the lengths
+    /// alone order them.
+    fn cmp_by(&self, p: u128, len: usize, texts: impl FnOnce() -> Ordering) -> Ordering {
+        self.prefix.cmp(&p).then_with(|| {
+            if (self.len as usize).min(len) <= PREFIX {
+                (self.len as usize).cmp(&len)
+            } else {
+                texts()
+            }
+        })
+    }
+}
+
+/// The token ids sorted by text, to find a token by its text. The searches
+/// compare the prefixes and lengths of the [`Entry`]s, and read a text only
+/// when both are longer than their common prefix.
+struct ByText(Vec<Entry>);
+
+impl ByText {
+    /// For a text listed twice, the last id counts
+    fn new(tokens: &[String]) -> Self {
+        let mut entries: Vec<Entry> = tokens
+            .iter()
+            .enumerate()
+            .map(|(id, t)| Entry {
+                prefix: prefix(t.as_bytes(), b""),
+                id: id as TokenId,
+                len: t.len() as u32,
+            })
+            .collect();
+        let text = |e: &Entry| tokens[e.id as usize].as_bytes();
+        let cmp =
+            |x: &Entry, y: &Entry| x.cmp_by(y.prefix, y.len as usize, || text(x).cmp(text(y)));
+        entries.sort_unstable_by(|x, y| cmp(x, y).then(y.id.cmp(&x.id)));
+        entries.dedup_by(|y, x| cmp(x, y) == Ordering::Equal);
+        ByText(entries)
+    }
+
+    /// The id of the token whose text is `a` followed by `b`
+    fn find(&self, tokens: &[String], a: &str, b: &str) -> Option<TokenId> {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        let p = prefix(a, b);
+        let i = self.0.binary_search_by(|e| e.cmp(tokens, p, a, b)).ok()?;
+        Some(self.0[i].id)
+    }
+
+    /// [`find`](Self::find) for each of the `n` texts `query(i)`, at once: in
+    /// the order of their prefixes, alongside the sorted ids, so each search
+    /// only covers the ids with the same prefix
+    fn find_all<'a>(
+        &self,
+        tokens: &[String],
+        n: usize,
+        query: impl Fn(usize) -> (&'a str, &'a str),
+    ) -> Vec<Option<TokenId>> {
+        let mut order: Vec<(u128, u32)> = (0..n)
+            .map(|i| {
+                let (a, b) = query(i);
+                (prefix(a.as_bytes(), b.as_bytes()), i as u32)
+            })
+            .collect();
+        order.sort_unstable();
+        let mut found = vec![None; n];
+        let mut hi = 0;
+        for group in order.chunk_by(|x, y| x.0 == y.0) {
+            let p = group[0].0;
+            let mut lo = hi;
+            while lo < self.0.len() && self.0[lo].prefix < p {
+                lo += 1;
+            }
+            hi = lo;
+            while hi < self.0.len() && self.0[hi].prefix == p {
+                hi += 1;
+            }
+            let same = &self.0[lo..hi];
+            for &(_, i) in group {
+                let (a, b) = query(i as usize);
+                let (a, b) = (a.as_bytes(), b.as_bytes());
+                found[i as usize] = same
+                    .binary_search_by(|e| e.cmp(tokens, p, a, b))
+                    .ok()
+                    .map(|j| same[j].id);
+            }
+        }
+        found
+    }
+}
+
 /// The characters [`byte_to_unicode`] maps bytes to are all below this
 const UNICODE_BYTES: usize = 0x144;
 
@@ -124,7 +254,18 @@ fn byte_to_unicode() -> [char; 256] {
 
 impl Tokenizer {
     pub fn from_gguf(gguf: &Gguf) -> Result<Self, Error> {
-        let m = &gguf.metadata;
+        Self::from_metadata(&gguf.metadata)
+    }
+
+    /// The tokenizer of a GGUF file, from its first bytes: only its metadata
+    /// is parsed, and of it only the `tokenizer.*` keys are read. The tensor
+    /// table and data, and the other shards of a split file, are not needed.
+    pub fn from_gguf_bytes(buf: &[u8]) -> Result<Self, Error> {
+        let m = read_metadata(buf, |key| key.starts_with("tokenizer."))?;
+        Self::from_metadata(&m)
+    }
+
+    pub fn from_metadata(m: &Metadata) -> Result<Self, Error> {
         let ggml = &m.tokenizer.ggml;
         let model = need!(m, tokenizer.ggml.model)?;
         let pre = ggml.pre.as_deref().unwrap_or("qwen35");
@@ -164,37 +305,44 @@ impl Tokenizer {
             })
             .collect();
 
-        let token_to_id: HashMap<String, TokenId> = tokens
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.clone(), i as TokenId))
-            .collect();
+        let by_text = ByText::new(&tokens);
+        let id = |a: &str, b: &str| by_text.find(&tokens, a, b);
 
         let mut byte_tokens = [0; 256];
         for (b, c) in byte_to_unicode().iter().enumerate() {
             let c = c.to_string();
-            byte_tokens[b] = *token_to_id.get(&c).ok_or(Error::MissingToken(c))?;
+            byte_tokens[b] = id(&c, "").ok_or(Error::MissingToken(c))?;
         }
 
-        let mut merges = Vec::new();
-        for (rank, merge) in need!(m, tokenizer.ggml.merges)?.iter().enumerate() {
-            let Some((l, r)) = merge.split_once(' ') else {
-                continue;
-            };
-            let (Some(&li), Some(&ri), Some(&mi)) = (
-                token_to_id.get(l),
-                token_to_id.get(r),
-                token_to_id.get(&format!("{l}{r}")),
-            ) else {
-                continue;
-            };
-            let m = Merge {
-                right: ri,
-                rank: rank as u32,
-                merged: mi,
-            };
-            merges.push((li, m));
-        }
+        // the left, right and merged token of each merge: 3 lookups each
+        let pairs: Vec<(u32, &str, &str)> = need!(m, tokenizer.ggml.merges)?
+            .iter()
+            .enumerate()
+            .filter_map(|(rank, merge)| {
+                let (l, r) = merge.split_once(' ')?;
+                Some((rank as u32, l, r))
+            })
+            .collect();
+        let ids = by_text.find_all(&tokens, 3 * pairs.len(), |i| {
+            let (_, l, r) = pairs[i / 3];
+            match i % 3 {
+                0 => (l, ""),
+                1 => (r, ""),
+                _ => (l, r),
+            }
+        });
+        let merges = pairs
+            .iter()
+            .zip(ids.as_chunks().0)
+            .filter_map(|(&(rank, _, _), &[li, right, merged])| {
+                let merge = Merge {
+                    right: right?,
+                    rank,
+                    merged: merged?,
+                };
+                Some((li?, merge))
+            })
+            .collect();
         let merges = Merges::new(tokens.len(), merges);
 
         let mut specials: Vec<(String, TokenId)> = tokens
@@ -208,7 +356,7 @@ impl Tokenizer {
         let eos = *need!(m, tokenizer.ggml.eos_token_id)?;
         let mut eog = vec![eos];
         for t in ["<|im_end|>", "<|endoftext|>", "<|end_of_text|>"] {
-            if let Some(&i) = token_to_id.get(t)
+            if let Some(i) = id(t, "")
                 && !eog.contains(&i)
             {
                 eog.push(i);
@@ -219,7 +367,7 @@ impl Tokenizer {
             tokens,
             bytes,
             is_special,
-            token_to_id,
+            by_text,
             merges,
             byte_tokens,
             specials,
@@ -234,7 +382,7 @@ impl Tokenizer {
     }
 
     pub fn token_id(&self, text: &str) -> Option<TokenId> {
-        self.token_to_id.get(text).copied()
+        self.by_text.find(&self.tokens, text, "")
     }
 
     pub fn is_special(&self, id: TokenId) -> bool {
@@ -511,6 +659,52 @@ impl StreamDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn by_text_lookup() {
+        let tokens: Vec<String> = [
+            "ab",
+            "abcdefghijklmnop1",
+            "a",
+            "abcdefghijklmnop",
+            "abcdefghijklmnop2",
+            "",
+            "b",
+            "ab",
+            "abcdefghijklmnopqr",
+            "a\0",
+            "a\0\0",
+        ]
+        .map(String::from)
+        .into();
+        let t = ByText::new(&tokens);
+        let queries = [
+            // listed twice: the last id
+            (("ab", ""), Some(7)),
+            (("a", "b"), Some(7)),
+            (("", "ab"), Some(7)),
+            // the same first 16 bytes
+            (("abcdefghijklmnop", ""), Some(3)),
+            (("abcdefghijklmnop", "1"), Some(1)),
+            (("abcdefgh", "ijklmnop2"), Some(4)),
+            (("abcdefghijklmnop", "qr"), Some(8)),
+            (("abcdefghijklmnop", "q"), None),
+            (("abcdefghijklmnop", "3"), None),
+            // the same prefix, zero-padded
+            (("a", "\0"), Some(9)),
+            (("a\0\0", ""), Some(10)),
+            (("a\0\0\0", ""), None),
+            (("", ""), Some(5)),
+            (("b", ""), Some(6)),
+            (("c", ""), None),
+            (("abc", ""), None),
+        ];
+        for ((a, b), id) in queries {
+            assert_eq!(t.find(&tokens, a, b), id, "{a:?} {b:?}");
+        }
+        let all = t.find_all(&tokens, queries.len(), |i| queries[i].0);
+        assert_eq!(all, queries.map(|q| q.1));
+    }
 
     #[test]
     fn merges_lookup() {

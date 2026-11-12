@@ -1,23 +1,29 @@
-//! Qwen3.5 / Qwen3.8 dense hybrid decoder (llama.cpp arch `qwen35`).
+//! Qwen3.5 / Qwen3.8 hybrid decoder (llama.cpp archs `qwen35` and
+//! `qwen35moe`).
 //!
-//! Ported from llama.cpp `src/models/qwen35.cpp` and `delta-net-base.cpp`.
+//! Ported from llama.cpp `src/models/qwen35.cpp`, `qwen35moe.cpp` and
+//! `delta-net-base.cpp`.
 //! Every `full_attention_interval`-th layer is gated full attention (GQA,
 //! partial NeoX rope, sigmoid output gate); the others are Gated DeltaNet
-//! linear attention with a short causal conv and a recurrent state.
+//! linear attention with a short causal conv and a recurrent state. The
+//! feed-forward is dense, or a mixture of experts: a router picks the top-k
+//! experts of each token, whose SwiGLU outputs are summed with their
+//! weights, plus a shared expert behind a sigmoid gate.
 //!
 //! The MTP (next-n) block stored after the trunk drafts tokens for
 //! speculative decoding: [`Model::draft`] proposes, [`Model::verify`] runs
 //! the proposals through the trunk and [`Model::keep`] drops the rejected ones.
 
 use crate::Error;
-use crate::engine::DraftLogits;
+use crate::engine::{DraftLogits, Pass};
 use crate::gguf::{Gguf, TensorInfo, need, tensor};
 #[cfg(not(any(feature = "std", test)))]
 use crate::math::Float;
+use crate::memory::{ModelMemory, SessionMemory, Shape};
 use crate::ops::{self, Input, Weight, matmul_new};
 use crate::par::*;
 use crate::prelude::*;
-use crate::quant;
+use crate::quant::{self, GgmlType};
 use crate::tokenizer::TokenId;
 use alloc::collections::VecDeque;
 
@@ -41,23 +47,41 @@ pub struct Config {
     pub ssm_state: usize,
     pub ssm_k_heads: usize,
     pub ssm_v_heads: usize,
+    /// the mixture of experts feed-forwards of `qwen35moe`, instead of dense ones
+    pub moe: Option<MoeConfig>,
+}
+
+/// A mixture of experts: each token goes through the `n_expert_used` experts
+/// of highest softmax router probability, weighted by these probabilities
+/// over their sum, and through the shared expert, gated by a sigmoid
+#[derive(Debug, Clone)]
+pub struct MoeConfig {
+    pub n_expert: usize,
+    /// experts per token
+    pub n_expert_used: usize,
+    /// width of an expert's feed-forward
+    pub n_ff_exp: usize,
+    /// width of the shared expert's, 0 without one
+    pub n_ff_shexp: usize,
 }
 
 impl Config {
     pub fn from_gguf(g: &Gguf) -> Result<Self, Error> {
         let m = &g.metadata;
-        let arch = need!(m, general.architecture)?;
-        if arch != "qwen35" {
-            return Err(Error::UnsupportedArchitecture(arch.clone()));
-        }
-        let q = &m.qwen35;
+        let arch = need!(m, general.architecture)?.as_str();
+        let q = match arch {
+            "qwen35" => &m.qwen35,
+            "qwen35moe" => &m.qwen35moe,
+            _ => return Err(Error::UnsupportedArchitecture(arch.into())),
+        };
         let u = |v: Option<u64>| v.map(|v| v as usize);
+        let need = |v: Result<&u64, Error>| v.map(|&v| v as usize);
 
-        let block_count = *need!(m, qwen35.block_count)? as usize;
+        let block_count = need(need!(q, @arch, block_count))?;
         let nextn = u(q.nextn_predict_layers).unwrap_or(0);
         let n_layer = block_count - nextn;
-        let n_embd = *need!(m, qwen35.embedding_length)? as usize;
-        let n_head = *need!(m, qwen35.attention.head_count)? as usize;
+        let n_embd = need(need!(q, @arch, embedding_length))?;
+        let n_head = need(need!(q, @arch, attention.head_count))?;
         let head_dim = u(q.attention.key_length).unwrap_or(n_embd / n_head);
         if u(q.attention.value_length).unwrap_or(head_dim) != head_dim {
             return Err(Error::UnsupportedModel("key_length != value_length"));
@@ -69,32 +93,56 @@ impl Config {
                 (0..n_layer).map(|i| (i + 1) % interval != 0).collect()
             }
         };
-        let ssm_state = *need!(m, qwen35.ssm.state_size)? as usize;
-        let ssm_v_heads = *need!(m, qwen35.ssm.time_step_rank)? as usize;
-        if *need!(m, qwen35.ssm.inner_size)? as usize != ssm_state * ssm_v_heads {
+        let ssm_state = need(need!(q, @arch, ssm.state_size))?;
+        let ssm_v_heads = need(need!(q, @arch, ssm.time_step_rank))?;
+        if need(need!(q, @arch, ssm.inner_size))? != ssm_state * ssm_v_heads {
             return Err(Error::UnsupportedModel(
                 "ssm.inner_size != state_size * time_step_rank",
             ));
         }
         let n_vocab = tensor!(g.tensors, token_embd.weight)?.dims[1] as usize;
 
+        let moe = if arch == "qwen35moe" {
+            let n_expert = need(need!(q, @arch, expert_count))?;
+            let n_expert_used = need(need!(q, @arch, expert_used_count))?;
+            if n_expert_used == 0 || n_expert_used > n_expert {
+                return Err(Error::UnsupportedModel(
+                    "expert_used_count not in 1..=expert_count",
+                ));
+            }
+            Some(MoeConfig {
+                n_expert,
+                n_expert_used,
+                n_ff_exp: need(need!(q, @arch, expert_feed_forward_length))?,
+                n_ff_shexp: u(q.expert_shared_feed_forward_length).unwrap_or(0),
+            })
+        } else {
+            None
+        };
+        // a mixture of experts has no dense feed-forward
+        let n_ff = match moe {
+            Some(_) => u(q.feed_forward_length).unwrap_or(0),
+            None => need(need!(q, @arch, feed_forward_length))?,
+        };
+
         Ok(Config {
             n_layer,
             n_embd,
-            n_ff: *need!(m, qwen35.feed_forward_length)? as usize,
+            n_ff,
             n_vocab,
             n_head,
-            n_head_kv: *need!(m, qwen35.attention.head_count_kv)? as usize,
+            n_head_kv: need(need!(q, @arch, attention.head_count_kv))?,
             head_dim,
             n_rot: u(q.rope.dimension_count).unwrap_or(head_dim),
             rope_base: q.rope.freq_base.unwrap_or(10_000.0),
-            eps: *need!(m, qwen35.attention.layer_norm_rms_epsilon)?,
+            eps: *need!(q, @arch, attention.layer_norm_rms_epsilon)?,
             context_length: u(q.context_length).unwrap_or(4096),
             recurrent,
-            conv_kernel: *need!(m, qwen35.ssm.conv_kernel)? as usize,
+            conv_kernel: need(need!(q, @arch, ssm.conv_kernel))?,
             ssm_state,
-            ssm_k_heads: *need!(m, qwen35.ssm.group_count)? as usize,
+            ssm_k_heads: need(need!(q, @arch, ssm.group_count))?,
             ssm_v_heads,
+            moe,
         })
     }
 
@@ -139,13 +187,84 @@ pub(crate) enum Mixer<'a> {
     DeltaNet(DeltaNet<'a>),
 }
 
+/// A stack of weight matrices of one shape, one per expert, in one tensor
+#[derive(Clone, Copy)]
+pub(crate) struct Experts<'a> {
+    pub(crate) ty: GgmlType,
+    pub(crate) cols: usize,
+    pub(crate) rows: usize,
+    pub(crate) n: usize,
+    /// the tensor's data
+    pub(crate) data: &'a [u8],
+    /// bytes from an expert's matrix to the next
+    pub(crate) stride: usize,
+    /// bytes from the start of an expert's matrix to these rows: the up half
+    /// of a fused gate and up
+    pub(crate) offset: usize,
+}
+
+impl<'a> Experts<'a> {
+    pub(crate) fn row_bytes(&self) -> usize {
+        self.ty.row_size(self.cols)
+    }
+
+    /// The matrix of expert `e`
+    pub(crate) fn expert(&self, e: usize) -> Weight<'a> {
+        let start = e * self.stride + self.offset;
+        let data = &self.data[start..start + self.rows * self.row_bytes()];
+        Weight::new(self.ty, self.cols, self.rows, data)
+    }
+}
+
+/// A feed-forward of the experts' shape every token goes through, its output
+/// scaled by `sigmoid(gate_inp · x)`
+pub(crate) struct SharedExpert<'a> {
+    pub(crate) gate: Weight<'a>,
+    pub(crate) up: Weight<'a>,
+    pub(crate) down: Weight<'a>,
+    /// one row
+    pub(crate) gate_inp: Weight<'a>,
+}
+
+/// A mixture of experts feed-forward, see [`MoeConfig`]
+pub(crate) struct Moe<'a> {
+    /// the experts' logits of a token
+    pub(crate) router: Weight<'a>,
+    pub(crate) gate: Experts<'a>,
+    pub(crate) up: Experts<'a>,
+    pub(crate) down: Experts<'a>,
+    pub(crate) shared: Option<SharedExpert<'a>>,
+}
+
+pub(crate) enum Ffn<'a> {
+    /// `down(silu(gate x) * up x)`
+    Dense {
+        gate: Weight<'a>,
+        up: Weight<'a>,
+        down: Weight<'a>,
+    },
+    Moe(Box<Moe<'a>>),
+}
+
 pub(crate) struct Layer<'a> {
     pub(crate) attn_norm: Vec<f32>,
     pub(crate) post_norm: Vec<f32>,
     pub(crate) mixer: Mixer<'a>,
-    pub(crate) ffn_gate: Weight<'a>,
-    pub(crate) ffn_up: Weight<'a>,
-    pub(crate) ffn_down: Weight<'a>,
+    pub(crate) ffn: Ffn<'a>,
+}
+
+/// The `k` experts of highest probability, from a token's router logits,
+/// and their weights: the probabilities over their sum. In order of
+/// probability, the lowest index first among equals.
+pub(crate) fn route(logits: &[f32], k: usize) -> (Vec<usize>, Vec<f32>) {
+    let mut p = logits.to_vec();
+    ops::softmax(&mut p);
+    let mut ids: Vec<usize> = (0..p.len()).collect();
+    ids.sort_by(|&a, &b| p[b].total_cmp(&p[a]).then(a.cmp(&b)));
+    ids.truncate(k);
+    let sum = ids.iter().map(|&i| p[i]).sum::<f32>().max(1.0 / 16384.0);
+    let w = ids.iter().map(|&i| p[i] / sum).collect();
+    (ids, w)
 }
 
 /// The MTP head: row `p` combines the normalized hidden state of token `p`
@@ -170,6 +289,7 @@ pub struct Model<'a> {
     pub(crate) layers: Vec<Layer<'a>>,
     pub(crate) mtp: Option<Mtp<'a>>,
     pub(crate) inv_freq: Vec<f32>,
+    pub(crate) memory: ModelMemory,
 }
 
 struct Loader<'g> {
@@ -199,6 +319,105 @@ impl<'g> Loader<'g> {
             });
         }
         Ok(Weight::new(info.ty, cols, rows, self.g.data(info)))
+    }
+
+    /// A stack of `n` matrices of `rows` rows of `cols`, one per expert
+    fn experts(
+        &self,
+        info: Result<&TensorInfo, Error>,
+        cols: usize,
+        rows: usize,
+        n: usize,
+    ) -> Result<Experts<'g>, Error> {
+        let info = info?;
+        let expected = [cols as u64, rows as u64, n as u64];
+        if info.dims != expected {
+            return Err(Error::TensorShape {
+                tensor: info.name.clone(),
+                dims: info.dims.clone(),
+                expected: expected.into(),
+            });
+        }
+        if !info.ty.has_dot() {
+            return Err(Error::NoKernel {
+                tensor: info.name.clone(),
+                ty: info.ty,
+            });
+        }
+        Ok(Experts {
+            ty: info.ty,
+            cols,
+            rows,
+            n,
+            data: self.g.data(info),
+            stride: rows * info.ty.row_size(cols),
+            offset: 0,
+        })
+    }
+
+    /// A vector of `n` as a weight of one row
+    fn row(&self, info: Result<&TensorInfo, Error>, n: usize) -> Result<Weight<'g>, Error> {
+        let info = info?;
+        if info.dims != [n as u64] {
+            return Err(Error::TensorShape {
+                tensor: info.name.clone(),
+                dims: info.dims.clone(),
+                expected: vec![n as u64],
+            });
+        }
+        if !info.ty.has_dot() {
+            return Err(Error::NoKernel {
+                tensor: info.name.clone(),
+                ty: info.ty,
+            });
+        }
+        Ok(Weight::new(info.ty, n, 1, self.g.data(info)))
+    }
+
+    fn ffn(&self, cfg: &Config, i: usize) -> Result<Ffn<'g>, Error> {
+        let l = self;
+        let e = cfg.n_embd;
+        let t = &self.g.tensors;
+        let Some(moe) = &cfg.moe else {
+            return Ok(Ffn::Dense {
+                gate: l.weight(tensor!(t, blk[i].ffn_gate.weight), e, cfg.n_ff)?,
+                up: l.weight(tensor!(t, blk[i].ffn_up.weight), e, cfg.n_ff)?,
+                down: l.weight(tensor!(t, blk[i].ffn_down.weight), cfg.n_ff, e)?,
+            });
+        };
+        let (n, ff) = (moe.n_expert, moe.n_ff_exp);
+        let (gate, up) = match tensor!(t, blk[i].ffn_gate_up_exps.weight) {
+            // gate rows then up rows, per expert
+            Ok(info) => {
+                let both = l.experts(Ok(info), e, 2 * ff, n)?;
+                let half = Experts { rows: ff, ..both };
+                let up = Experts {
+                    offset: ff * both.row_bytes(),
+                    ..half
+                };
+                (half, up)
+            }
+            Err(_) => (
+                l.experts(tensor!(t, blk[i].ffn_gate_exps.weight), e, ff, n)?,
+                l.experts(tensor!(t, blk[i].ffn_up_exps.weight), e, ff, n)?,
+            ),
+        };
+        let shared = match moe.n_ff_shexp {
+            0 => None,
+            sff => Some(SharedExpert {
+                gate: l.weight(tensor!(t, blk[i].ffn_gate_shexp.weight), e, sff)?,
+                up: l.weight(tensor!(t, blk[i].ffn_up_shexp.weight), e, sff)?,
+                down: l.weight(tensor!(t, blk[i].ffn_down_shexp.weight), sff, e)?,
+                gate_inp: l.row(tensor!(t, blk[i].ffn_gate_inp_shexp.weight), e)?,
+            }),
+        };
+        Ok(Ffn::Moe(Box::new(Moe {
+            router: l.weight(tensor!(t, blk[i].ffn_gate_inp.weight), e, n)?,
+            gate,
+            up,
+            down: l.experts(tensor!(t, blk[i].ffn_down_exps.weight), ff, e, n)?,
+            shared,
+        })))
     }
 
     fn vec(&self, info: Result<&TensorInfo, Error>, n: usize) -> Result<Vec<f32>, Error> {
@@ -256,9 +475,7 @@ impl<'g> Loader<'g> {
             attn_norm: l.vec(tensor!(t, blk[i].attn_norm.weight), e)?,
             post_norm: l.vec(tensor!(t, blk[i].post_attention_norm.weight), e)?,
             mixer,
-            ffn_gate: l.weight(tensor!(t, blk[i].ffn_gate.weight), e, cfg.n_ff)?,
-            ffn_up: l.weight(tensor!(t, blk[i].ffn_up.weight), e, cfg.n_ff)?,
-            ffn_down: l.weight(tensor!(t, blk[i].ffn_down.weight), cfg.n_ff, e)?,
+            ffn: l.ffn(cfg, i)?,
         })
     }
 }
@@ -301,6 +518,7 @@ impl<'a> Model<'a> {
 
         Ok(Model {
             output_norm: l.vec(tensor!(t, output_norm.weight), e)?,
+            memory: ModelMemory::from_gguf(g, &cfg, mtp.is_some()),
             cfg,
             tok_embd,
             output,
@@ -313,6 +531,14 @@ impl<'a> Model<'a> {
     /// Whether the model can draft tokens for speculative decoding
     pub fn has_mtp(&self) -> bool {
         self.mtp.is_some()
+    }
+
+    pub(crate) fn shape(&self) -> Shape<'_> {
+        Shape {
+            cfg: &self.cfg,
+            has_mtp: self.has_mtp(),
+            head_row_bytes: self.output.data.len() / self.output.rows,
+        }
     }
 
     /// An empty sequence able to hold `context` tokens, its memory allocated
@@ -364,14 +590,21 @@ impl<'a> Model<'a> {
         } else {
             None
         };
-        Ok(State {
+        let state = State {
             layers,
             n_past: 0,
             context,
             kv_dim,
             mtp,
             verify: None,
-        })
+        };
+        debug_assert_eq!(
+            state.memory().allocated(),
+            self.shape()
+                .cpu_session(context, state.mtp.is_some() as usize, 1)
+                .allocated()
+        );
+        Ok(state)
     }
 
     /// Run `tokens` through the model, appending them to `state`.
@@ -618,13 +851,50 @@ impl<'a> Model<'a> {
     }
 
     fn ffn(&self, layer: &Layer<'_>, h: &[f32], n: usize) -> Vec<f32> {
+        match &layer.ffn {
+            Ffn::Dense { gate, up, down } => dense_ffn(gate, up, down, &Input::new(h, n)),
+            Ffn::Moe(m) => self.moe(m, h, n),
+        }
+    }
+
+    /// Each token through its experts, each expert over its tokens at once
+    fn moe(&self, m: &Moe<'_>, h: &[f32], n: usize) -> Vec<f32> {
+        let e = self.cfg.n_embd;
+        let k = self.cfg.moe.as_ref().expect("a moe config").n_expert_used;
         let input = Input::new(h, n);
-        let mut gate = matmul_new(&layer.ffn_gate, &input);
-        let up = matmul_new(&layer.ffn_up, &input);
-        gate.par_iter_mut()
-            .zip(up.par_iter())
-            .for_each(|(g, u)| *g = ops::silu(*g) * u);
-        matmul_new(&layer.ffn_down, &Input::new(&gate, n))
+        let logits = matmul_new(&m.router, &input);
+        // the (token, weight) pairs of each expert
+        let mut routed: Vec<Vec<(usize, f32)>> = vec![Vec::new(); m.gate.n];
+        for (t, l) in logits.chunks_exact(m.gate.n).enumerate() {
+            let (ids, w) = route(l, k);
+            for (i, w) in ids.into_iter().zip(w) {
+                routed[i].push((t, w));
+            }
+        }
+        let mut out = vec![0.0f32; n * e];
+        for (i, pairs) in routed.iter().enumerate().filter(|(_, p)| !p.is_empty()) {
+            let mut x = Vec::with_capacity(pairs.len() * e);
+            for &(t, _) in pairs {
+                x.extend_from_slice(&h[t * e..(t + 1) * e]);
+            }
+            let y = dense_ffn(
+                &m.gate.expert(i),
+                &m.up.expert(i),
+                &m.down.expert(i),
+                &Input::new(&x, pairs.len()),
+            );
+            for (&(t, w), y) in pairs.iter().zip(y.chunks_exact(e)) {
+                quant::axpy(&mut out[t * e..(t + 1) * e], w, y);
+            }
+        }
+        if let Some(s) = &m.shared {
+            let y = dense_ffn(&s.gate, &s.up, &s.down, &input);
+            let g = matmul_new(&s.gate_inp, &input);
+            for ((o, y), g) in out.chunks_exact_mut(e).zip(y.chunks_exact(e)).zip(g) {
+                quant::axpy(o, ops::sigmoid(g), y);
+            }
+        }
+        out
     }
 
     fn attention(
@@ -845,14 +1115,14 @@ impl<'a> Model<'a> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Pass {
-    /// no logits
-    Prefill,
-    /// logits of the last token
-    Forward,
-    /// logits of every token, and the states to go back to any of them
-    Verify,
+/// `down(silu(gate x) * up x)`
+fn dense_ffn(gate: &Weight<'_>, up: &Weight<'_>, down: &Weight<'_>, input: &Input<'_>) -> Vec<f32> {
+    let mut g = matmul_new(gate, input);
+    let u = matmul_new(up, input);
+    g.par_iter_mut()
+        .zip(u.par_iter())
+        .for_each(|(g, u)| *g = ops::silu(*g) * u);
+    matmul_new(down, &Input::new(&g, input.n))
 }
 
 enum LayerState {
@@ -881,16 +1151,6 @@ fn zeroed(n: usize) -> Result<Vec<f32>, Error> {
     let mut v = reserved(n)?;
     v.resize(n, 0.0);
     Ok(v)
-}
-
-impl LayerState {
-    /// Memory held, whether used yet or not
-    fn bytes(&self) -> usize {
-        match self {
-            LayerState::Attention { k, v } => (k.capacity() + v.capacity()) * 4,
-            LayerState::DeltaNet { conv, s, .. } => (conv.len() + s.len()) * 4,
-        }
-    }
 }
 
 struct MtpState {
@@ -1017,18 +1277,24 @@ pub struct State {
 }
 
 impl State {
-    pub fn kv_bytes(&self) -> usize {
-        let head = self
-            .mtp
-            .as_ref()
-            .and_then(|m| m.head.as_ref())
-            .map_or(0, |(_, rows)| rows.capacity());
-        self.layers
-            .iter()
-            .chain(self.mtp.as_ref().map(|m| &m.kv))
-            .map(LayerState::bytes)
-            .sum::<usize>()
-            + head
+    /// The memory the state holds, measured, but
+    /// [`SessionMemory::transient`]: what its passes allocate
+    pub fn memory(&self) -> SessionMemory {
+        let mut m = SessionMemory::default();
+        for ls in self.layers.iter().chain(self.mtp.as_ref().map(|m| &m.kv)) {
+            match ls {
+                LayerState::Attention { k, v } => {
+                    m.kv += 4 * (k.capacity() + v.capacity());
+                    m.kv_per_token += 2 * 4 * self.kv_dim;
+                }
+                LayerState::DeltaNet { conv, s, .. } => m.recurrent += 4 * (conv.len() + s.len()),
+            }
+        }
+        if let Some(mtp) = &self.mtp {
+            m.scratch += 4 * mtp.last.len();
+            m.draft_head = mtp.head.as_ref().map_or(0, |(_, rows)| rows.capacity());
+        }
+        m
     }
 
     /// A copy of the state: the kv caches of the `n_past` tokens, the delta net states
@@ -1185,5 +1451,25 @@ impl LayerState {
             }
             _ => unreachable!("checked by fits"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_picks_and_weighs() {
+        // probabilities 0.5, 0.25, 0.125, 0.125 (equal logits for experts 2, 3)
+        let l = [2f32.ln() + 1.0, 1.0, 0.5f32.ln() + 1.0, 0.5f32.ln() + 1.0].map(|x| x - 1.0);
+        let (ids, w) = route(&l, 3);
+        // the lower expert first among equals
+        assert_eq!(ids, [0, 1, 2]);
+        let sum = 0.5 + 0.25 + 0.125;
+        for (w, p) in w.iter().zip([0.5, 0.25, 0.125]) {
+            assert!((w - p / sum).abs() < 1e-6, "{w} {}", p / sum);
+        }
+        let (ids, w) = route(&l, 1);
+        assert_eq!((ids, w), (vec![0], vec![1.0]));
     }
 }

@@ -8,6 +8,7 @@ use std::cell::RefCell;
 
 use biv::Error;
 use biv::engine::{DraftLogits, Engine, Session, Snapshot};
+use biv::memory::{ModelMemory, SessionMemory};
 use biv::sampler::{Sampler, SamplerConfig};
 use biv::tokenizer::TokenId;
 
@@ -80,6 +81,14 @@ impl Engine for Script {
     fn numerics(&self) -> Vec<(&'static str, String)> {
         Vec::new()
     }
+
+    fn model_memory(&self) -> ModelMemory {
+        ModelMemory::default()
+    }
+
+    fn session_memory(&self, _context: usize, _draft: usize) -> SessionMemory {
+        SessionMemory::default()
+    }
 }
 
 impl Session for ScriptSession<'_> {
@@ -123,8 +132,8 @@ impl Session for ScriptSession<'_> {
         self.n_past
     }
 
-    fn state_bytes(&self) -> usize {
-        0
+    fn memory(&self) -> SessionMemory {
+        SessionMemory::default()
     }
 
     fn snapshot(&self) -> Result<Snapshot, Error> {

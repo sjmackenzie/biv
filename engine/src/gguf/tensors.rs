@@ -116,6 +116,20 @@ node! {
         ffn_up: Param,
         ffn_down: Param,
 
+        /// mixture of experts: the router, `[n_embd, n_expert]`
+        ffn_gate_inp: Param,
+        /// the experts' matrices, `[cols, rows, n_expert]`; gate and up may
+        /// be one, gate rows then up rows
+        ffn_gate_exps: Param,
+        ffn_up_exps: Param,
+        ffn_gate_up_exps: Param,
+        ffn_down_exps: Param,
+        /// the shared expert, and the vector of its sigmoid gate
+        ffn_gate_shexp: Param,
+        ffn_up_shexp: Param,
+        ffn_down_shexp: Param,
+        ffn_gate_inp_shexp: Param,
+
         /// query and output gate, interleaved per head
         attn_q: Param,
         attn_k: Param,

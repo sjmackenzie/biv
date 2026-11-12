@@ -9,6 +9,7 @@ use std::sync::{Mutex, PoisonError};
 use biv::Error;
 use biv::chat::{Chat, ChatOptions, Event, TurnStats};
 use biv::engine::{DraftLogits, Engine, Session, Snapshot};
+use biv::memory::{ModelMemory, SessionMemory};
 use biv::model::Model;
 use biv::sampler::{Sampler, SamplerConfig};
 use biv::tokenizer::{TokenId, Tokenizer};
@@ -89,6 +90,14 @@ impl Engine for Recording<'_> {
     fn numerics(&self) -> Vec<(&'static str, String)> {
         self.inner.numerics()
     }
+
+    fn model_memory(&self) -> ModelMemory {
+        self.inner.model_memory()
+    }
+
+    fn session_memory(&self, context: usize, draft: usize) -> SessionMemory {
+        self.inner.session_memory(context, draft)
+    }
 }
 
 impl Session for RecordingSession<'_> {
@@ -132,8 +141,8 @@ impl Session for RecordingSession<'_> {
         self.inner.n_past()
     }
 
-    fn state_bytes(&self) -> usize {
-        self.inner.state_bytes()
+    fn memory(&self) -> SessionMemory {
+        self.inner.memory()
     }
 
     fn snapshot(&self) -> Result<Snapshot, Error> {
