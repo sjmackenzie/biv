@@ -86,9 +86,22 @@ impl SamplerConfig {
     }
 }
 
+/// A rule of which tokens may come next, such as a grammar that the text
+/// must follow. A caller sets it on a [`Sampler`] with
+/// [`Sampler::set_mask`]; the sampler applies it before each choice, and
+/// the chat tells it each chosen token through [`Sampler::accept`].
+pub trait TokenMask {
+    /// Set the logit of each token that may not come next to minus
+    /// infinity. At least one token must stay allowed.
+    fn mask(&self, logits: &mut [f32]);
+    /// `token` was chosen, so the next [`TokenMask::mask`] follows it
+    fn advance(&mut self, token: TokenId);
+}
+
 pub struct Sampler {
     pub cfg: SamplerConfig,
     rng: u64,
+    mask: Option<Box<dyn TokenMask>>,
 }
 
 impl Sampler {
@@ -98,7 +111,11 @@ impl Sampler {
         } else {
             0x9E37_79B9_7F4A_7C15
         };
-        Sampler { cfg, rng: seed | 1 }
+        Sampler {
+            cfg,
+            rng: seed | 1,
+            mask: None,
+        }
     }
 
     /// The random generator's state after the tokens sampled so far, to
@@ -119,6 +136,7 @@ impl Sampler {
         Ok(Sampler {
             cfg,
             rng: rng_state,
+            mask: None,
         })
     }
 
@@ -131,6 +149,30 @@ impl Sampler {
         (v >> 40) as f32 / (1u64 << 24) as f32
     }
 
+    /// Apply `mask` before each choice from now on, until
+    /// [`Sampler::clear_mask`]
+    pub fn set_mask(&mut self, mask: Box<dyn TokenMask>) {
+        self.mask = Some(mask);
+    }
+
+    /// Stop masking, and give the mask back
+    pub fn clear_mask(&mut self) -> Option<Box<dyn TokenMask>> {
+        self.mask.take()
+    }
+
+    /// Whether a mask is set. A chat drafts no tokens while it is, so that
+    /// each step chooses one token through the mask.
+    pub fn masked(&self) -> bool {
+        self.mask.is_some()
+    }
+
+    /// `token` was chosen: the mask, if set, follows it
+    pub fn accept(&mut self, token: TokenId) {
+        if let Some(m) = &mut self.mask {
+            m.advance(token);
+        }
+    }
+
     /// Whether the sampler picks the most likely token
     pub fn greedy(&self) -> bool {
         self.cfg.temperature <= 0.0
@@ -139,6 +181,7 @@ impl Sampler {
     /// Pick the next token; `recent` is the generated history used by the penalties
     pub fn sample(&mut self, logits: &mut [f32], recent: &[TokenId]) -> TokenId {
         self.penalize(logits, recent);
+        self.apply_mask(logits);
         if self.greedy() {
             return argmax(logits);
         }
@@ -150,6 +193,7 @@ impl Sampler {
     /// probability) pairs, best first, their sum 1 or a bit less. Not greedy.
     pub fn distribution(&self, logits: &mut [f32], recent: &[TokenId]) -> Vec<(TokenId, f32)> {
         self.penalize(logits, recent);
+        self.apply_mask(logits);
         self.probs(enumerate(logits))
     }
 
@@ -170,6 +214,18 @@ impl Sampler {
             }
         }
         cand.last().unwrap().0
+    }
+
+    /// The mask, if set, over `logits`. A mask that allows no token is a
+    /// fault of the mask, and no choice can follow it.
+    fn apply_mask(&self, logits: &mut [f32]) {
+        if let Some(m) = &self.mask {
+            m.mask(logits);
+            assert!(
+                logits.iter().any(|l| *l > f32::NEG_INFINITY),
+                "the token mask allows no token"
+            );
+        }
     }
 
     fn penalize(&self, logits: &mut [f32], recent: &[TokenId]) {
@@ -385,4 +441,135 @@ mod tests {
             (d.temperature, d.top_k, d.top_p, d.min_p, d.repeat_last_n)
         );
     }
+
+    /// A mask that allows only the tokens of `allowed`, and counts the
+    /// tokens it was told of
+    struct Only {
+        allowed: Vec<TokenId>,
+        advanced: Vec<TokenId>,
+    }
+
+    impl TokenMask for Only {
+        fn mask(&self, logits: &mut [f32]) {
+            for (t, l) in logits.iter_mut().enumerate() {
+                if !self.allowed.contains(&(t as TokenId)) {
+                    *l = f32::NEG_INFINITY;
+                }
+            }
+        }
+        fn advance(&mut self, token: TokenId) {
+            self.advanced.push(token);
+        }
+    }
+
+    /// A mask that allows only the token after the last one it was told of
+    struct Next {
+        last: TokenId,
+    }
+
+    impl TokenMask for Next {
+        fn mask(&self, logits: &mut [f32]) {
+            for (t, l) in logits.iter_mut().enumerate() {
+                if t as TokenId != self.last + 1 {
+                    *l = f32::NEG_INFINITY;
+                }
+            }
+        }
+        fn advance(&mut self, token: TokenId) {
+            self.last = token;
+        }
+    }
+
+    /// The token that the mask of the follow test starts after
+    const FIRST: TokenId = 0;
+    const ALLOWED: [TokenId; 2] = [2, 3];
+    const DRAWS: usize = 200;
+    const GREEDY: f32 = 0.0;
+
+    fn only() -> Box<dyn TokenMask> {
+        Box::new(Only {
+            allowed: ALLOWED.to_vec(),
+            advanced: Vec::new(),
+        })
+    }
+
+    fn sampling() -> Sampler {
+        Sampler::new(SamplerConfig {
+            top_k: 0,
+            seed: SEED,
+            ..SamplerConfig::default()
+        })
+    }
+
+    #[test]
+    fn a_greedy_sampler_takes_the_likeliest_allowed_token() {
+        let mut s = Sampler::new(SamplerConfig {
+            temperature: GREEDY,
+            ..SamplerConfig::default()
+        });
+        s.set_mask(only());
+        let mut l = logits();
+        assert!(!ALLOWED.contains(&argmax(&l)), "the likeliest token is forbidden");
+        let t = s.sample(&mut l, &[]);
+        assert!(ALLOWED.contains(&t), "{t} is allowed");
+    }
+
+    #[test]
+    fn a_sampling_sampler_draws_only_allowed_tokens() {
+        let mut s = sampling();
+        s.set_mask(only());
+        for t in draws(&mut s, DRAWS) {
+            assert!(ALLOWED.contains(&t), "{t} is allowed");
+        }
+    }
+
+    #[test]
+    fn the_distribution_holds_only_allowed_tokens() {
+        let mut s = sampling();
+        s.set_mask(only());
+        let d = s.distribution(&mut logits(), &[]);
+        assert!(!d.is_empty());
+        for (t, p) in d {
+            assert!(ALLOWED.contains(&t) || p == 0.0, "{t} has p {p}");
+        }
+    }
+
+    #[test]
+    fn the_mask_follows_each_accepted_token() {
+        let mut s = Sampler::new(SamplerConfig {
+            temperature: GREEDY,
+            ..SamplerConfig::default()
+        });
+        s.set_mask(Box::new(Next { last: FIRST }));
+        let mut chosen = Vec::new();
+        for _ in 0..ALLOWED.len() {
+            let t = s.sample(&mut logits(), &[]);
+            s.accept(t);
+            chosen.push(t);
+        }
+        assert_eq!(chosen, vec![1, 2]);
+    }
+
+    #[test]
+    fn with_no_mask_the_draws_are_the_same() {
+        let mut plain = sampling();
+        let mut cleared = sampling();
+        cleared.set_mask(only());
+        assert!(cleared.masked());
+        assert!(cleared.clear_mask().is_some());
+        assert!(!cleared.masked());
+        assert_eq!(draws(&mut plain, DRAWS), draws(&mut cleared, DRAWS));
+    }
+
+    #[test]
+    #[should_panic(expected = "the token mask allows no token")]
+    fn a_mask_that_allows_no_token_is_refused() {
+        let mut s = sampling();
+        s.set_mask(Box::new(Only {
+            allowed: Vec::new(),
+            advanced: Vec::new(),
+        }));
+        s.sample(&mut logits(), &[]);
+    }
+
 }

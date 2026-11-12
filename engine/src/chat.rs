@@ -675,6 +675,7 @@ impl<'m> Chat<'m> {
             stats.gen_tokens += 1;
             stats.tokens.push(next);
             self.generated.push(next);
+            sampler.accept(next);
             on_event(Event::Token(next));
 
             if next == self.im_end || self.tok.eog.contains(&next) {
@@ -839,6 +840,11 @@ impl<'m> Chat<'m> {
         room: usize,
         sampler: &mut Sampler,
     ) -> (Vec<TokenId>, Vec<Option<Dist>>, bool) {
+        // a draft passes no mask: while one is set, each step chooses one
+        // token through it
+        if sampler.masked() {
+            return (Vec::new(), Vec::new(), false);
+        }
         let mut found = if self.opts.lookup > 0 {
             continuation(&self.history, self.opts.lookup)
         } else {
