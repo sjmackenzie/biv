@@ -636,6 +636,8 @@ fn compare(op: CmpOp, l: &Value, r: &Value, line: u32) -> Res<bool> {
         CmpOp::Eq | CmpOp::Ne => {
             let l = not_top(l.clone(), line)?;
             let r = not_top(r.clone(), line)?;
+            filters::plain(&l, "a comparison", line)?;
+            filters::plain(&r, "a comparison", line)?;
             let eq = py_eq(&l, &r);
             Ok(if op == CmpOp::Eq { eq } else { !eq })
         }

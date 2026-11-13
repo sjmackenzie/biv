@@ -269,8 +269,24 @@ fn case_with_content(name: &str, content: &str) -> Vec<(String, Value)> {
     vars
 }
 
-/// The case of the probes of the origin tests: one user message
-const PROBE_CASE: &str = "user";
+/// The cases of the probes of the origin tests, in order: one user
+/// message, then one user message with tools, for a template that the
+/// reference also fails with no tools
+const PROBE_CASES: [&str; 2] = ["user", "tools"];
+
+/// The first probe case that `template` renders, and its segments, with
+/// the content of its last message set to `content`
+fn probe(
+    template: &Template,
+    content: &str,
+) -> Option<(&'static str, Vec<biv::template::Segment>)> {
+    PROBE_CASES.iter().find_map(|case| {
+        template
+            .render(&case_with_content(case, content), Some(FIXED_DATE))
+            .ok()
+            .map(|s| (*case, s))
+    })
+}
 
 /// The templates of the corpus that load, with their names
 fn loaded() -> Vec<(String, Template)> {
@@ -301,10 +317,9 @@ fn joined(segments: &[biv::template::Segment], origin: Origin) -> String {
 fn a_message_with_the_text_of_the_template_stays_content() {
     let mut checked = 0;
     for (stem, template) in loaded() {
-        // a template that the reference also fails on this case is skipped:
-        // the corpus test checks those failures
-        let Ok(probe) = template.render(&case_with_content(PROBE_CASE, "x"), Some(FIXED_DATE))
-        else {
+        // a template that the reference fails on every probe case is
+        // skipped: the corpus test checks those failures
+        let Some((case, probe)) = probe(&template, "x") else {
             continue;
         };
         // all the text of the template in the probe, with its special token
@@ -315,10 +330,7 @@ fn a_message_with_the_text_of_the_template_stays_content() {
             .map(|s| s.text.as_str())
             .collect();
         let segments = template
-            .render(
-                &case_with_content(PROBE_CASE, &template_text),
-                Some(FIXED_DATE),
-            )
+            .render(&case_with_content(case, &template_text), Some(FIXED_DATE))
             .unwrap_or_else(|e| panic!("{stem}: {e}"));
         let content = joined(&segments, Origin::Content);
         assert!(
@@ -361,8 +373,7 @@ fn a_message_with_special_token_texts_gives_no_control_token() {
         };
         let control = |ids: &[u32]| ids.iter().filter(|id| tok.is_special(**id)).count();
         for (stem, template) in loaded() {
-            let Ok(empty) = template.render(&case_with_content(PROBE_CASE, ""), Some(FIXED_DATE))
-            else {
+            let Some((case, empty)) = probe(&template, "") else {
                 continue;
             };
             let template_text = joined(&empty, Origin::Template);
@@ -377,7 +388,7 @@ fn a_message_with_special_token_texts_gives_no_control_token() {
             }
             let message = found.join(" ");
             let with = template
-                .render(&case_with_content(PROBE_CASE, &message), Some(FIXED_DATE))
+                .render(&case_with_content(case, &message), Some(FIXED_DATE))
                 .unwrap_or_else(|e| panic!("{stem}: {e}"));
             assert_eq!(
                 control(&tokens(&with)),

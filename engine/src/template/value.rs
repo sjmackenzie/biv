@@ -51,6 +51,13 @@ impl OStr {
         self.markup
     }
 
+    /// This string as a plain string: the ~ operator of the reference
+    /// joins with str, so its result is no Markup
+    pub fn into_plain(mut self) -> OStr {
+        self.markup = false;
+        self
+    }
+
     /// This string as a Markup string
     pub fn into_markup(mut self) -> OStr {
         self.markup = true;
@@ -187,9 +194,17 @@ pub enum Value {
     /// a method of a value, not yet called
     Method(Rc<(Value, String)>),
     /// a generator of the reference, as map, select and items give it
-    Generator(Rc<Vec<Value>>),
+    Generator(Rc<Generator>),
     /// the loop object of a for loop
     Loop(Rc<LoopState>),
+}
+
+/// A generator of the reference: Python iterates it once, so a second
+/// iteration fails by name in biv, where Python gives no items
+#[derive(Debug)]
+pub struct Generator {
+    pub items: Vec<Value>,
+    pub used: core::cell::Cell<bool>,
 }
 
 /// The global functions of the renderer

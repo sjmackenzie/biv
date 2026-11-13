@@ -60,6 +60,11 @@ pub enum ErrorKind {
     Runtime(String),
     /// macro calls nested past the bound
     Recursion(String),
+    /// a generator iterated a second time: Python gives no items there
+    GeneratorReused,
+    /// an operation on a Markup string (from the safe filter) other than
+    /// output, +, and the safe filter
+    MarkupUnsupported(&'static str),
     /// strftime_now with no date given
     DateMissing,
     /// strftime_now with a format code outside %Y %m %d %b %B
@@ -80,6 +85,8 @@ impl fmt::Display for TemplateError {
             ErrorKind::Value(m) => ("TemplateValueError", m.clone()),
             ErrorKind::Runtime(m) => ("TemplateRuntimeError", m.clone()),
             ErrorKind::Recursion(m) => ("TemplateRecursion", m.clone()),
+            ErrorKind::GeneratorReused => ("TemplateGeneratorReused", String::new()),
+            ErrorKind::MarkupUnsupported(what) => ("TemplateMarkupUnsupported", (*what).into()),
             ErrorKind::DateMissing => ("TemplateDateMissing", String::new()),
             ErrorKind::DateFormat(c) => ("TemplateDateFormat", format!("%{c}")),
         };

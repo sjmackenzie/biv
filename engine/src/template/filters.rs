@@ -8,7 +8,7 @@ use core::cmp::Ordering;
 use super::eval::{Renderer, Res, binop_name, defined, err, not_top, type_err};
 use super::json::{self, DumpOptions};
 use super::parser::BinOp;
-use super::value::{Function, Number, OStr, Origin, Undefined, Value, py_eq, to_ostr};
+use super::value::{Function, Generator, Number, OStr, Origin, Undefined, Value, py_eq, to_ostr};
 use super::{Date, ErrorKind};
 use crate::prelude::*;
 
@@ -236,6 +236,7 @@ fn undefined(name: &str, line: u32) -> Value {
 
 /// The items of a for loop over `v`, or of list(v)
 pub fn iterate(v: &Value, line: u32) -> Res<Vec<Value>> {
+    plain(v, "an iteration", line)?;
     Ok(match v {
         // an unset value iterates as empty
         Value::Undefined(_) => Vec::new(),
@@ -244,7 +245,13 @@ pub fn iterate(v: &Value, line: u32) -> Res<Vec<Value>> {
             .char_indices()
             .map(|(at, c)| Value::ostr(s.slice(at, at + c.len_utf8())))
             .collect(),
-        Value::List(l) | Value::Tuple(l) | Value::Generator(l) => l.to_vec(),
+        Value::List(l) | Value::Tuple(l) => l.to_vec(),
+        Value::Generator(g) => {
+            if g.used.replace(true) {
+                return Err(err(ErrorKind::GeneratorReused, line));
+            }
+            g.items.clone()
+        }
         Value::Map(m) => m.iter().map(|(k, _)| k.clone()).collect(),
         other => {
             return Err(type_err(
@@ -266,7 +273,19 @@ fn iterate_if_true(v: &Value, line: u32) -> Res<Vec<Value>> {
 }
 
 fn generator(items: Vec<Value>) -> Value {
-    Value::Generator(Rc::new(items))
+    Value::Generator(Rc::new(Generator {
+        items,
+        used: core::cell::Cell::new(false),
+    }))
+}
+
+/// Fail by name on a Markup string: the subset has its output, +, and the
+/// safe filter only
+pub fn plain(v: &Value, what: &'static str, line: u32) -> Res<()> {
+    match v {
+        Value::Str(s) if s.is_markup() => Err(err(ErrorKind::MarkupUnsupported(what), line)),
+        _ => Ok(()),
+    }
 }
 
 /// obj.attr, as jinja2 gives it: an attribute of Python first (a method),
@@ -317,6 +336,7 @@ fn index_of(i: i64, len: usize) -> Option<usize> {
 /// obj[key], as jinja2 gives it: an item first, then an attribute for a
 /// string key, else Undefined
 pub fn getitem(obj: &Value, key: &Value, line: u32) -> Res<Value> {
+    plain(obj, "an item", line)?;
     let int_key = match key {
         Value::Int(i) => Some(*i),
         Value::Bool(b) => Some(i64::from(*b)),
@@ -380,6 +400,7 @@ pub fn slice(
     step: Option<i64>,
     line: u32,
 ) -> Res<Value> {
+    plain(v, "a slice", line)?;
     let step = step.unwrap_or(1);
     if step == 0 {
         return Err(err(
@@ -424,7 +445,7 @@ pub fn binary(op: BinOp, l: Value, r: Value, line: u32) -> Res<Value> {
         let (l, r) = (not_top(l, line)?, not_top(r, line)?);
         let mut s = to_ostr(&l);
         s.push_ostr(&to_ostr(&r));
-        return Ok(Value::ostr(s));
+        return Ok(Value::ostr(s.into_plain()));
     }
     let (l, r) = (defined(l, line)?, defined(r, line)?);
     let unsupported = |l: &Value, r: &Value| {
@@ -480,6 +501,12 @@ pub fn binary(op: BinOp, l: Value, r: Value, line: u32) -> Res<Value> {
                 out.push_ostr(s);
             }
             return Ok(Value::ostr(out));
+        }
+        (_, Value::Str(s), _) | (_, _, Value::Str(s)) if s.is_markup() && op != BinOp::Add => {
+            return Err(err(
+                ErrorKind::MarkupUnsupported("an operator other than +"),
+                line,
+            ));
         }
         (BinOp::Mod, Value::Str(_), _) => {
             return Err(err(
@@ -595,7 +622,8 @@ pub fn contains(container: &Value, item: &Value, line: u32) -> Res<bool> {
                 ));
             }
         },
-        Value::List(l) | Value::Tuple(l) | Value::Generator(l) => l.iter().any(|v| py_eq(v, item)),
+        Value::List(l) | Value::Tuple(l) => l.iter().any(|v| py_eq(v, item)),
+        Value::Generator(_) => iterate(container, line)?.iter().any(|v| py_eq(v, item)),
         Value::Map(m) => m.iter().any(|(k, _)| py_eq(k, item)),
         other => {
             return Err(type_err(
@@ -608,6 +636,8 @@ pub fn contains(container: &Value, item: &Value, line: u32) -> Res<bool> {
 
 /// The order of two values, as < of Python gives it
 pub fn order(l: &Value, r: &Value, line: u32, symbol: &str) -> Res<Ordering> {
+    plain(l, "a comparison", line)?;
+    plain(r, "a comparison", line)?;
     if let (Some(a), Some(b)) = (l.number(), r.number()) {
         return match (a, b) {
             (Number::Int(x), Number::Int(y)) => Ok(x.cmp(&y)),
@@ -978,6 +1008,7 @@ pub fn call_method(
             format!("'{}' object has no method {name}", obj.type_name()),
         ));
     };
+    plain(obj, "a method", line)?;
     Ok(match name {
         "split" | "rsplit" => {
             let sep = opt_str(arg(args, kwargs, 0, "sep"), line, "the separator")?;
@@ -1119,6 +1150,9 @@ pub fn filter(
     }
     if !REFERENCE_FILTERS.contains(&name) {
         return Err(err(ErrorKind::FilterUnknown(name.into()), line));
+    }
+    if name != "safe" {
+        plain(&v, "a filter other than safe", line)?;
     }
     let v = not_top(v, line)?;
     Ok(match name {
@@ -1392,6 +1426,7 @@ fn unsupported_filter(name: &str) -> &'static str {
 
 /// The test `name` of `v`
 pub fn test(name: &str, v: &Value, args: &[Value], line: u32) -> Res<bool> {
+    plain(v, "a test", line)?;
     let other = || -> Res<&Value> {
         args.first()
             .ok_or_else(|| type_err(line, format!("the test {name} takes an argument")))
