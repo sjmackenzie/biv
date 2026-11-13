@@ -93,6 +93,11 @@ pub fn serve<R: Send>(
                 passes: 0,
                 shared: 0,
                 tokens: 0,
+                sequences: 0,
+                pass_time: Duration::ZERO,
+                drafts: 0,
+                draft_tokens: 0,
+                draft_time: Duration::ZERO,
             },
         }
         .run(rx);
@@ -118,6 +123,18 @@ pub struct Passes {
     pub shared: u64,
     /// the tokens of all passes
     pub tokens: u64,
+    /// the sequences of all passes, each counted once for each pass that
+    /// holds its tokens: over `passes`, the mean sequences of a pass
+    pub sequences: u64,
+    /// the time of the engine in the passes
+    pub pass_time: Duration,
+    /// the drafts that the scheduler served: each one runs for one sequence,
+    /// outside the passes
+    pub drafts: u64,
+    /// the tokens of those drafts
+    pub draft_tokens: u64,
+    /// the time of the engine in those drafts, with the picks of their chats
+    pub draft_time: Duration,
 }
 
 /// What the handle answers without asking the scheduler
@@ -514,6 +531,7 @@ impl Scheduler<'_, '_> {
                 reply,
                 picks,
             } => {
+                let start = Instant::now();
                 let drafts = b.draft(seq, next, n, &mut |l| {
                     let msg = DraftMsg::Logits {
                         logits: l.logits.to_vec(),
@@ -525,6 +543,9 @@ impl Scheduler<'_, '_> {
                     }
                     picks.recv().unwrap_or(0)
                 });
+                self.passes.drafts += 1;
+                self.passes.draft_tokens += drafts.len() as u64;
+                self.passes.draft_time += start.elapsed();
                 let _ = reply.send(DraftMsg::Done(drafts));
             }
             Request::Keep { seq, n } => b.keep(seq, n),
@@ -622,10 +643,13 @@ impl Scheduler<'_, '_> {
                 }
             })
             .collect();
+        let start = Instant::now();
         let out = self.batch.run(&work);
+        self.passes.pass_time += start.elapsed();
         // a sequence has at most one request in the queue, so each piece is
         // the tokens of another sequence
         self.passes.passes += 1;
+        self.passes.sequences += pieces.len() as u64;
         if pieces.len() > 1 {
             self.passes.shared += 1;
         }

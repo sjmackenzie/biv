@@ -82,7 +82,7 @@ fn passes_of(engine: &Script, tok: &Tokenizer, chats: usize) -> Passes {
 }
 
 /// The passes count each token that the sessions took. With one chat no
-/// pass holds the tokens of two sequences.
+/// pass holds the tokens of two sequences, and each pass holds one.
 #[test]
 #[ignore = "needs a model file"]
 fn the_passes_of_one_chat_hold_its_tokens_and_none_is_shared() {
@@ -95,6 +95,10 @@ fn the_passes_of_one_chat_hold_its_tokens_and_none_is_shared() {
     assert_eq!(passes.tokens, engine.fed.borrow().len() as u64);
     assert_eq!(passes.shared, 0);
     assert!(passes.passes > 1, "the prompt is more than one pass");
+    // each pass holds the one sequence, and the scripted engine drafts nothing
+    assert_eq!(passes.sequences, passes.passes);
+    assert_eq!((passes.drafts, passes.draft_tokens), (0, 0));
+    assert!(passes.pass_time > Duration::ZERO);
 }
 
 /// With two chats the passes hold the tokens of both, the same tokens as
@@ -114,4 +118,7 @@ fn the_passes_of_two_chats_hold_the_tokens_of_both() {
     assert_eq!(passes.tokens, TWO_CHATS as u64 * alone.tokens);
     assert!(passes.shared <= passes.passes);
     assert!(passes.passes <= TWO_CHATS as u64 * alone.passes);
+    // a pass holds one or two sequences, and a shared pass holds two
+    assert_eq!(passes.sequences, passes.passes + passes.shared);
+    assert_eq!(passes.sequences, TWO_CHATS as u64 * alone.sequences);
 }
