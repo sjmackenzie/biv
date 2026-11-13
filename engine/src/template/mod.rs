@@ -15,6 +15,7 @@ mod filters;
 pub mod json;
 mod lexer;
 mod parser;
+mod probe;
 #[cfg(test)]
 mod tests;
 mod value;
@@ -22,6 +23,7 @@ mod value;
 use core::fmt;
 
 pub use check::LoadReport;
+pub use probe::{ChatFormat, EFFORT_WORDS, ProbeError, Reasoning, ToolCall, ToolCallForm};
 pub use value::{OStr, Origin, Segment, Value};
 
 use crate::prelude::*;

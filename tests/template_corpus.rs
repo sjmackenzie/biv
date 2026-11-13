@@ -409,3 +409,77 @@ fn a_message_with_special_token_texts_gives_no_control_token() {
         "no template wrote a special token of these vocabularies"
     );
 }
+
+/// The variable that names the GGUF files of the probe test, and the
+/// corpus template of each, as <a.gguf>=<template>:<b.gguf>=<template>
+const PROBE_PAIRS_ENV: &str = "BIV_TEST_PROBE_PAIRS";
+
+#[test]
+#[ignore = "needs GGUF files: BIV_TEST_PROBE_PAIRS=<a.gguf>=<template stem>:..."]
+fn the_probes_give_the_texts_of_each_local_template() {
+    use biv::template::ChatFormat;
+    use biv::tokenizer::Tokenizer;
+    let pairs = std::env::var(PROBE_PAIRS_ENV)
+        .unwrap_or_else(|_| panic!("{PROBE_PAIRS_ENV} must name pairs"));
+    for pair in pairs.split(':') {
+        let (path, stem) = pair.split_once('=').expect("<gguf>=<template stem>");
+        let gguf = biv_cli::open_gguf(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let tok = Tokenizer::from_gguf(&gguf).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let is_special = |t: &str| tok.token_id(t).is_some_and(|id| tok.is_special(id));
+        let source = std::fs::read_to_string(Path::new(CORPUS).join(format!("{stem}.jinja")))
+            .expect("the template");
+        let template = Template::load(&source, &VARIABLES).expect("it loads");
+        let format =
+            ChatFormat::probe(&template, &is_special).unwrap_or_else(|e| panic!("{stem}: {e:?}"));
+        println!("probe {stem}: {format:?}");
+        // the texts of the two local templates, which chat.rs fixes in code now
+        use biv::template::{Reasoning, ToolCall, ToolCallForm};
+        assert_eq!(format.turn_end, "<|im_end|>", "{stem}");
+        assert_eq!(
+            format.generation_prompt_thinking, "<|im_start|>assistant\n<think>\n",
+            "{stem}"
+        );
+        assert_eq!(
+            format.generation_prompt_plain, "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            "{stem}"
+        );
+        assert_eq!(
+            format.tool_call,
+            Some(ToolCall {
+                open: "<tool_call>".into(),
+                close: "</tool_call>".into(),
+                form: ToolCallForm::XmlParameters,
+            }),
+            "{stem}"
+        );
+        // the larger template keeps the reasoning of an earlier answer and
+        // takes the three efforts; the smaller drops that reasoning and
+        // writes no effort
+        let (reasoning, efforts) = if stem.contains("27B") {
+            (
+                Some(Reasoning {
+                    open: "<think>\n".into(),
+                    close: "\n</think>\n\n".into(),
+                }),
+                Some(biv::template::EFFORT_WORDS.to_vec()),
+            )
+        } else {
+            (None, None)
+        };
+        assert_eq!(format.reasoning, reasoning, "{stem}");
+        assert_eq!(format.efforts, efforts, "{stem}");
+        let mut outcomes: std::collections::BTreeMap<String, usize> = Default::default();
+        for (_, t) in loaded() {
+            let key = match ChatFormat::probe(&t, &is_special) {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("{e:?}")
+                    .split('(')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+            };
+            *outcomes.entry(key).or_default() += 1;
+        }
+        println!("probe outcomes with the vocabulary of {stem}: {outcomes:?}");
+    }
+}
