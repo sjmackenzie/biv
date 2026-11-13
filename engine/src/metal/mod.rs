@@ -45,12 +45,21 @@ const PAGE: usize = if cfg!(target_arch = "aarch64") {
 /// from the cache (a verify pass of 2 tokens costs 1.2x a decode step, 3 1.6x)
 const MV_MAX_ROWS: usize = 3;
 /// Matmul inputs of up to this many rows use the `mmv` kernels, which read the
-/// weights once for 8 input rows (on an M2 Max, a pass of 4 to 8 tokens costs
-/// 1.75-1.9x a decode step, 12 to 16 3.2-3.4x); more use the `mm`
-/// kernels, whose tiles are 32 rows (~4.7x from 5 to 32 tokens)
-pub const MMV_MAX_ROWS: usize = 16;
+/// weights once for the input rows of a threadgroup; more use the `mm`
+/// kernels, whose tiles are 32 rows (on an M3 Max, a pass of 17 to 32 tokens
+/// on `mm` cost 4.8-5.0x a decode step)
+pub const MMV_MAX_ROWS: usize = MMV32_ROWS;
 /// Input rows and weight rows (2 simdgroups of 8) per `mmv` threadgroup
 pub const MMV_ROWS: usize = 8;
+/// Input rows per threadgroup of the `mmv16` and `mmv32` kernels, which hold
+/// two and four input fragments of 8 rows in each simdgroup. Each output of
+/// `mmv16` has the same bits as with `mmv`; `mmv32` takes passes of 17 to 32
+/// rows from `mm`, and its sums round differently.
+pub const MMV16_ROWS: usize = 16;
+pub const MMV32_ROWS: usize = 32;
+/// The row limits of the `mmv` kernels that [`MetalEngine::with_mmv_rows`]
+/// takes: [`MMV16_ROWS`] gives the numbers of `mm` from 17 rows
+pub const MMV_ROW_LIMITS: [usize; 2] = [MMV16_ROWS, MMV32_ROWS];
 const MMV_WEIGHT_ROWS: usize = 16;
 /// The pairs of an expert are multiplied by `mm_id` in tiles of 32, the last
 /// one too when it has this many pairs or more; the others by `mmv_id` in
@@ -266,6 +275,24 @@ kernels! {
     MmvQ4K => "mmv_q4_K",
     MmvQ5K => "mmv_q5_K",
     MmvQ6K => "mmv_q6_K",
+    Mmv16F32 => "mmv16_f32",
+    Mmv16F16 => "mmv16_f16",
+    Mmv16Bf16 => "mmv16_bf16",
+    Mmv16Q4_0 => "mmv16_q4_0",
+    Mmv16Q4_1 => "mmv16_q4_1",
+    Mmv16Q8_0 => "mmv16_q8_0",
+    Mmv16Q4K => "mmv16_q4_K",
+    Mmv16Q5K => "mmv16_q5_K",
+    Mmv16Q6K => "mmv16_q6_K",
+    Mmv32F32 => "mmv32_f32",
+    Mmv32F16 => "mmv32_f16",
+    Mmv32Bf16 => "mmv32_bf16",
+    Mmv32Q4_0 => "mmv32_q4_0",
+    Mmv32Q4_1 => "mmv32_q4_1",
+    Mmv32Q8_0 => "mmv32_q8_0",
+    Mmv32Q4K => "mmv32_q4_K",
+    Mmv32Q5K => "mmv32_q5_K",
+    Mmv32Q6K => "mmv32_q6_K",
     AddInplace => "add_inplace",
     Swiglu => "swiglu",
     RmsNorm => "rms_norm",
@@ -338,6 +365,38 @@ fn mmv_kernel(ty: GgmlType) -> Option<Kernel> {
         GgmlType::Q4K => Kernel::MmvQ4K,
         GgmlType::Q5K => Kernel::MmvQ5K,
         GgmlType::Q6K => Kernel::MmvQ6K,
+        _ => return None,
+    })
+}
+
+/// The `mmv` kernels that take 16 input rows a threadgroup
+fn mmv16_kernel(ty: GgmlType) -> Option<Kernel> {
+    Some(match ty {
+        GgmlType::F32 => Kernel::Mmv16F32,
+        GgmlType::F16 => Kernel::Mmv16F16,
+        GgmlType::BF16 => Kernel::Mmv16Bf16,
+        GgmlType::Q4_0 => Kernel::Mmv16Q4_0,
+        GgmlType::Q4_1 => Kernel::Mmv16Q4_1,
+        GgmlType::Q8_0 => Kernel::Mmv16Q8_0,
+        GgmlType::Q4K => Kernel::Mmv16Q4K,
+        GgmlType::Q5K => Kernel::Mmv16Q5K,
+        GgmlType::Q6K => Kernel::Mmv16Q6K,
+        _ => return None,
+    })
+}
+
+/// The `mmv` kernels that take 32 input rows a threadgroup
+fn mmv32_kernel(ty: GgmlType) -> Option<Kernel> {
+    Some(match ty {
+        GgmlType::F32 => Kernel::Mmv32F32,
+        GgmlType::F16 => Kernel::Mmv32F16,
+        GgmlType::BF16 => Kernel::Mmv32Bf16,
+        GgmlType::Q4_0 => Kernel::Mmv32Q4_0,
+        GgmlType::Q4_1 => Kernel::Mmv32Q4_1,
+        GgmlType::Q8_0 => Kernel::Mmv32Q8_0,
+        GgmlType::Q4K => Kernel::Mmv32Q4K,
+        GgmlType::Q5K => Kernel::Mmv32Q5K,
+        GgmlType::Q6K => Kernel::Mmv32Q6K,
         _ => return None,
     })
 }
@@ -459,6 +518,8 @@ pub struct MetalEngine<'m> {
     inv_freq: Buffer,
     attn_nsg: usize,
     max_batch: usize,
+    /// Matmul inputs of up to this many rows use the `mmv` kernels
+    mmv_max_rows: usize,
 }
 
 fn upload(device: &Device, data: &[f32]) -> Result<Buffer, Error> {
@@ -608,6 +669,22 @@ fn gpu_layer(device: &Device, l: &Layer<'_>) -> Result<GpuLayer, Error> {
 
 impl<'m> MetalEngine<'m> {
     pub fn new(model: &'m Model<'m>, max_batch: usize) -> Result<Self, Error> {
+        Self::with_mmv_rows(model, max_batch, MMV_MAX_ROWS)
+    }
+
+    /// [`MetalEngine::new`] whose matmul inputs of up to `mmv_max_rows` rows
+    /// use the `mmv` kernels, and more the `mm` kernels. `mmv_max_rows` is
+    /// one of [`MMV_ROW_LIMITS`].
+    pub fn with_mmv_rows(
+        model: &'m Model<'m>,
+        max_batch: usize,
+        mmv_max_rows: usize,
+    ) -> Result<Self, Error> {
+        if !MMV_ROW_LIMITS.contains(&mmv_max_rows) {
+            return Err(backend(
+                "metal: the mmv row limit is not one of MMV_ROW_LIMITS",
+            ));
+        }
         let c = &model.cfg;
         if c.ssm_state != 128 || c.conv_kernel != 4 {
             return Err(backend(
@@ -682,6 +759,7 @@ impl<'m> MetalEngine<'m> {
             layers,
             mtp,
             max_batch: max_batch.max(1),
+            mmv_max_rows,
         })
     }
 
@@ -744,13 +822,22 @@ impl<'m> MetalEngine<'m> {
                     0,
                 )
             }
-            _ if n <= MMV_MAX_ROWS => self.dispatch(
-                enc,
-                mmv_kernel(w.ty).expect("checked at load"),
-                [w.rows.div_ceil(MMV_WEIGHT_ROWS), n.div_ceil(MMV_ROWS), 1],
-                [64, 1, 1],
-                0,
-            ),
+            _ if n <= self.mmv_max_rows => {
+                let (kernel, rows) = if n <= MMV_ROWS {
+                    (mmv_kernel(w.ty), MMV_ROWS)
+                } else if n <= MMV16_ROWS {
+                    (mmv16_kernel(w.ty), MMV16_ROWS)
+                } else {
+                    (mmv32_kernel(w.ty), MMV32_ROWS)
+                };
+                self.dispatch(
+                    enc,
+                    kernel.expect("checked at load"),
+                    [w.rows.div_ceil(MMV_WEIGHT_ROWS), n.div_ceil(rows), 1],
+                    [64, 1, 1],
+                    0,
+                )
+            }
             _ => {
                 let name = mm_kernel(w.ty).expect("checked at load");
                 self.dispatch(
@@ -859,6 +946,7 @@ impl Engine for MetalEngine<'_> {
             ("device", self.device.name().to_string()),
             ("kv_cache", "f16".into()),
             ("max_batch", self.max_batch.to_string()),
+            ("mmv_max_rows", self.mmv_max_rows.to_string()),
         ]
     }
 

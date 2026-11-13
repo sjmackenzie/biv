@@ -697,6 +697,31 @@ MMV_T("mmv_q4_K", block_q4_K)
 MMV_T("mmv_q5_K", block_q5_K)
 MMV_T("mmv_q6_K", block_q6_K)
 
+// two and four input fragments per simdgroup: one threadgroup takes 16 or
+// 32 input rows, so the weights are read once for that many rows
+#define MMV16_T(name, block) \
+template [[host_name(name)]] kernel void mmv<block, 1, 2, 4, 2>(constant MatArgs &, device const char *, device const char *, device float *, uint3, ushort, ushort);
+#define MMV32_T(name, block) \
+template [[host_name(name)]] kernel void mmv<block, 1, 2, 4, 4>(constant MatArgs &, device const char *, device const char *, device float *, uint3, ushort, ushort);
+MMV16_T("mmv16_f32", float4x4)
+MMV16_T("mmv16_f16", half4x4)
+MMV16_T("mmv16_bf16", block_bf16)
+MMV16_T("mmv16_q4_0", block_q4_0)
+MMV16_T("mmv16_q4_1", block_q4_1)
+MMV16_T("mmv16_q8_0", block_q8_0)
+MMV16_T("mmv16_q4_K", block_q4_K)
+MMV16_T("mmv16_q5_K", block_q5_K)
+MMV16_T("mmv16_q6_K", block_q6_K)
+MMV32_T("mmv32_f32", float4x4)
+MMV32_T("mmv32_f16", half4x4)
+MMV32_T("mmv32_bf16", block_bf16)
+MMV32_T("mmv32_q4_0", block_q4_0)
+MMV32_T("mmv32_q4_1", block_q4_1)
+MMV32_T("mmv32_q8_0", block_q8_0)
+MMV32_T("mmv32_q4_K", block_q4_K)
+MMV32_T("mmv32_q5_K", block_q5_K)
+MMV32_T("mmv32_q6_K", block_q6_K)
+
 // ---------------------------------------------------------------------------
 // matmul with simdgroup matrices: 64 weight rows x 32 input rows per
 // threadgroup of 4 simdgroups (ggml kernel_mul_mm, no tensor API).

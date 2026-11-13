@@ -48,8 +48,8 @@ pub struct BatchOptions {
 }
 
 /// The decode rows of a pass of [`BatchOptions::default`]: on Metal, the
-/// most rows that the `mmv` matmul kernels take, above which a pass costs
-/// about twice as much; elsewhere no limit
+/// most rows that the `mmv` matmul kernels take, above which the `mm`
+/// kernels take a pass and it costs more; elsewhere no limit
 #[cfg(all(feature = "metal", target_os = "macos"))]
 const DEFAULT_DECODE_ROWS: usize = crate::metal::MMV_MAX_ROWS;
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
