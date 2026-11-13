@@ -131,6 +131,11 @@ fn main() {
         let host_ms = match (host_start, batch.host_time()) {
             (Some(a), Some(b)) => {
                 let h = b.since(a);
+                assert_eq!(
+                    h.untimed, 0,
+                    "CommandBufferTimeMissing: {} command buffers of the case have no times",
+                    h.untimed
+                );
                 format!(
                     "encode {:7.2} wait {:7.2} (queue {:6.2} schedule {:6.2} completion {:6.2}) readback {:7.2}",
                     per_pass(h.encode),

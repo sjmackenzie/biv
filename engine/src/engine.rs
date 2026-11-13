@@ -116,6 +116,11 @@ pub struct HostTime {
     /// the last part of the wait: from the end of each command buffer on the
     /// device to the return of the wait for it
     pub completion: core::time::Duration,
+    /// the command buffers for which the device did not give its four times
+    /// in order: the parts of the wait and the device time hold nothing of
+    /// them. A reader that reports or decides on these times refuses them
+    /// by name when this count is not 0.
+    pub untimed: u64,
 }
 
 impl HostTime {
@@ -127,6 +132,7 @@ impl HostTime {
         queue: core::time::Duration::ZERO,
         schedule: core::time::Duration::ZERO,
         completion: core::time::Duration::ZERO,
+        untimed: 0,
     };
 
     /// The host time from `before` to this one
@@ -138,6 +144,7 @@ impl HostTime {
             queue: self.queue - before.queue,
             schedule: self.schedule - before.schedule,
             completion: self.completion - before.completion,
+            untimed: self.untimed - before.untimed,
         }
     }
 
@@ -150,6 +157,7 @@ impl HostTime {
             queue: self.queue + other.queue,
             schedule: self.schedule + other.schedule,
             completion: self.completion + other.completion,
+            untimed: self.untimed + other.untimed,
         }
     }
 }
@@ -619,7 +627,7 @@ mod tests {
     const BEFORE_MS: [u64; 6] = [3, 5, 7, 1, 2, 3];
     const AFTER_MS: [u64; 6] = [4, 9, 8, 2, 4, 6];
 
-    fn time(ms: [u64; 6]) -> HostTime {
+    fn time(ms: [u64; 6], untimed: u64) -> HostTime {
         let [encode, wait, readback, queue, schedule, completion] = ms.map(Duration::from_millis);
         HostTime {
             encode,
@@ -628,14 +636,15 @@ mod tests {
             queue,
             schedule,
             completion,
+            untimed,
         }
     }
 
     #[test]
     fn a_host_time_since_an_earlier_one_adds_back_to_it() {
-        let (before, after) = (time(BEFORE_MS), time(AFTER_MS));
+        let (before, after) = (time(BEFORE_MS, 2), time(AFTER_MS, 3));
         let pass = after.since(before);
-        assert_eq!(pass, time([1, 4, 1, 1, 2, 3]));
+        assert_eq!(pass, time([1, 4, 1, 1, 2, 3], 1));
         assert_eq!(before.plus(pass), after);
         assert_eq!(HostTime::ZERO.plus(pass), pass);
     }

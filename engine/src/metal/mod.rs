@@ -542,6 +542,8 @@ pub struct MetalEngine<'m> {
     queue_nanos: AtomicU64,
     schedule_nanos: AtomicU64,
     completion_nanos: AtomicU64,
+    /// the command buffers with no times in order: see [`HostTime`]
+    untimed: AtomicU64,
     /// the units of the host clock of Metal, for its times in seconds
     host_clock: HostClock,
 }
@@ -590,15 +592,35 @@ impl HostClock {
     }
 }
 
-/// The time from `from` to `to`, in seconds of one clock. A time of 0 is a
-/// time that Metal did not give, and an end before its start is not a
-/// time: both fail by name.
-fn interval(part: &str, from: f64, to: f64) -> Duration {
-    assert!(
-        from > 0.0 && to >= from,
-        "metal: CommandBufferTimeMissing: {part} from {from} to {to}"
-    );
-    Duration::from_secs_f64(to - from)
+/// The times of one command buffer on the host clock of Metal, in order:
+/// its commit, the start of the schedule of the driver, the start and the
+/// end on the device, and the return of the wait
+#[derive(Clone, Copy, Debug)]
+struct BufferTimes {
+    committed: f64,
+    kernel_start: f64,
+    gpu_start: f64,
+    gpu_end: f64,
+    returned: f64,
+}
+
+impl BufferTimes {
+    /// The four parts of the wait (queue, schedule, device, completion),
+    /// or None when the device did not give its times: a time of 0 or a
+    /// time before the one before it
+    fn parts(self) -> Option<[Duration; 4]> {
+        let t = [
+            self.committed,
+            self.kernel_start,
+            self.gpu_start,
+            self.gpu_end,
+            self.returned,
+        ];
+        if t.iter().any(|x| *x <= 0.0) || t.windows(2).any(|w| w[1] < w[0]) {
+            return None;
+        }
+        Some([0, 1, 2, 3].map(|i| Duration::from_secs_f64(t[i + 1] - t[i])))
+    }
 }
 
 /// Add `time` to the nanoseconds of `counter`
@@ -856,6 +878,7 @@ impl<'m> MetalEngine<'m> {
             queue_nanos: AtomicU64::new(0),
             schedule_nanos: AtomicU64::new(0),
             completion_nanos: AtomicU64::new(0),
+            untimed: AtomicU64::new(0),
             host_clock: HostClock::new(),
         })
     }
@@ -1732,24 +1755,30 @@ impl MetalEngine<'_> {
                 .unwrap_or_default();
             panic!("metal: command buffer failed: {msg}");
         }
-        let (kernel_start, gpu_start, gpu_end) =
-            (cb.kernelStartTime(), cb.GPUStartTime(), cb.GPUEndTime());
-        add_time(
-            &self.queue_nanos,
-            interval("queue", committed_s, kernel_start),
-        );
-        add_time(
-            &self.schedule_nanos,
-            interval("schedule", kernel_start, gpu_start),
-        );
-        add_time(&self.gpu_nanos, interval("gpu", gpu_start, gpu_end));
-        add_time(
-            &self.completion_nanos,
-            interval("completion", gpu_end, returned_s),
-        );
+        let times = BufferTimes {
+            committed: committed_s,
+            kernel_start: cb.kernelStartTime(),
+            gpu_start: cb.GPUStartTime(),
+            gpu_end: cb.GPUEndTime(),
+            returned: returned_s,
+        };
+        match times.parts() {
+            Some([queue, schedule, gpu, completion]) => {
+                add_time(&self.queue_nanos, queue);
+                add_time(&self.schedule_nanos, schedule);
+                add_time(&self.gpu_nanos, gpu);
+                add_time(&self.completion_nanos, completion);
+            }
+            // the pass goes on; its times are not counted, and the count of
+            // untimed command buffers tells the readers
+            None => {
+                self.untimed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
-    /// The GPU time of all command buffers of the engine since it started
+    /// The GPU time of the command buffers of the engine since it started,
+    /// of those with times only: see [`HostTime::untimed`]
     pub fn gpu_time(&self) -> Duration {
         time_of(&self.gpu_nanos)
     }
@@ -1763,6 +1792,7 @@ impl MetalEngine<'_> {
             queue: time_of(&self.queue_nanos),
             schedule: time_of(&self.schedule_nanos),
             completion: time_of(&self.completion_nanos),
+            untimed: self.untimed.load(Ordering::Relaxed),
         }
     }
 
@@ -2719,5 +2749,45 @@ impl Batch for MetalBatch<'_> {
     fn restore(&mut self, seq: SeqId, snapshot: &Snapshot) -> Result<(), Error> {
         let e = self.e;
         self.seq_mut(seq).restore(e, snapshot)
+    }
+}
+
+#[cfg(test)]
+mod buffer_times_tests {
+    use super::{BufferTimes, Duration};
+
+    /// Times of one command buffer in order, in seconds of the host clock
+    const IN_ORDER: [f64; 5] = [10.0, 10.5, 11.0, 13.0, 13.25];
+
+    fn times(t: [f64; 5]) -> BufferTimes {
+        BufferTimes {
+            committed: t[0],
+            kernel_start: t[1],
+            gpu_start: t[2],
+            gpu_end: t[3],
+            returned: t[4],
+        }
+    }
+
+    #[test]
+    fn the_parts_of_a_wait_add_up_to_it() {
+        let parts = times(IN_ORDER).parts().expect("times in order");
+        assert_eq!(parts, [0.5, 0.5, 2.0, 0.25].map(Duration::from_secs_f64));
+    }
+
+    #[test]
+    fn a_missing_or_reversed_time_gives_no_parts() {
+        for i in 1..IN_ORDER.len() {
+            let mut missing = IN_ORDER;
+            missing[i] = 0.0;
+            assert_eq!(times(missing).parts(), None, "time {i} missing");
+            let mut reversed = IN_ORDER;
+            reversed[i] = IN_ORDER[i - 1] - 1.0;
+            assert_eq!(
+                times(reversed).parts(),
+                None,
+                "time {i} before the one before it"
+            );
+        }
     }
 }
