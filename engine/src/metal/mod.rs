@@ -6,7 +6,7 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -18,7 +18,9 @@ use objc2_metal::{
 };
 
 use crate::Error;
-use crate::engine::{Batch, DraftLogits, Engine, Pass, SeqId, Session, Snapshot, Work, insert};
+use crate::engine::{
+    Batch, DraftLogits, Engine, HostTime, Pass, SeqId, Session, Snapshot, Work, insert,
+};
 use crate::memory::{DeviceMemory, ModelMemory, SessionMemory, Shape};
 use crate::model::{
     Config, DRAFT_CAP, DraftVocab, Experts, Ffn, Layer, Mixer, Model, copy_head_rows,
@@ -532,6 +534,21 @@ pub struct MetalEngine<'m> {
     mmv_max_rows: usize,
     /// The GPU time of all command buffers of the engine, in nanoseconds
     gpu_nanos: AtomicU64,
+    /// The host time of all command buffers of the engine, by part, in
+    /// nanoseconds: see [`HostTime`]
+    encode_nanos: AtomicU64,
+    wait_nanos: AtomicU64,
+    readback_nanos: AtomicU64,
+}
+
+/// Add `time` to the nanoseconds of `counter`
+fn add_time(counter: &AtomicU64, time: Duration) {
+    counter.fetch_add(time.as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// The time of the nanoseconds of `counter`
+fn time_of(counter: &AtomicU64) -> Duration {
+    Duration::from_nanos(counter.load(Ordering::Relaxed))
 }
 
 fn upload(device: &Device, data: &[f32]) -> Result<Buffer, Error> {
@@ -773,6 +790,9 @@ impl<'m> MetalEngine<'m> {
             max_batch: max_batch.max(1),
             mmv_max_rows,
             gpu_nanos: AtomicU64::new(0),
+            encode_nanos: AtomicU64::new(0),
+            wait_nanos: AtomicU64::new(0),
+            readback_nanos: AtomicU64::new(0),
         })
     }
 
@@ -1622,6 +1642,7 @@ impl MetalEngine<'_> {
 
     /// Encode into one command buffer and wait for it
     fn submit(&self, encode: impl FnOnce(&Encoder)) {
+        let start = Instant::now();
         let cb = self
             .queue
             .commandBuffer()
@@ -1632,7 +1653,10 @@ impl MetalEngine<'_> {
         encode(&enc);
         enc.endEncoding();
         cb.commit();
+        let committed = Instant::now();
         cb.waitUntilCompleted();
+        add_time(&self.wait_nanos, committed.elapsed());
+        add_time(&self.encode_nanos, committed - start);
         if cb.status() == MTLCommandBufferStatus::Error {
             let msg = cb
                 .error()
@@ -1641,15 +1665,21 @@ impl MetalEngine<'_> {
             panic!("metal: command buffer failed: {msg}");
         }
         let seconds = cb.GPUEndTime() - cb.GPUStartTime();
-        self.gpu_nanos.fetch_add(
-            Duration::from_secs_f64(seconds).as_nanos() as u64,
-            Ordering::Relaxed,
-        );
+        add_time(&self.gpu_nanos, Duration::from_secs_f64(seconds));
     }
 
     /// The GPU time of all command buffers of the engine since it started
     pub fn gpu_time(&self) -> Duration {
-        Duration::from_nanos(self.gpu_nanos.load(Ordering::Relaxed))
+        time_of(&self.gpu_nanos)
+    }
+
+    /// The host time of all command buffers of the engine since it started
+    pub fn host_time(&self) -> HostTime {
+        HostTime {
+            encode: time_of(&self.encode_nanos),
+            wait: time_of(&self.wait_nanos),
+            readback: time_of(&self.readback_nanos),
+        }
     }
 
     /// One pass of the tokens of several sequences, with the activations in
@@ -1830,7 +1860,8 @@ impl MetalEngine<'_> {
             }
         });
 
-        items
+        let readback = Instant::now();
+        let logits = items
             .iter_mut()
             .zip(&places)
             .map(|((seq, _, pass), p)| {
@@ -1861,7 +1892,9 @@ impl MetalEngine<'_> {
                     .map(|t| host(&s.logits, t * c.n_vocab, c.n_vocab).to_vec())
                     .collect()
             })
-            .collect()
+            .collect();
+        add_time(&self.readback_nanos, readback.elapsed());
+        logits
     }
 
     /// Up to `n` tokens the MTP head of `seq` predicts after `next`, with the
@@ -2508,6 +2541,10 @@ impl MetalBatch<'_> {
 impl Batch for MetalBatch<'_> {
     fn gpu_time(&self) -> Option<Duration> {
         Some(self.e.gpu_time())
+    }
+
+    fn host_time(&self) -> Option<HostTime> {
+        Some(self.e.host_time())
     }
 
     fn add(&mut self, context: usize, draft: usize) -> Result<SeqId, Error> {

@@ -7,7 +7,7 @@
 //! in the batch but are not in the pass. Each case runs one pass to warm,
 //! then `ITERS` timed passes, and prints the mean time of a pass, its ratio
 //! to a pass of one token of one sequence, and the GPU time of a pass.
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use biv::{
     engine::{self, Batch, Engine, Pass, Work},
@@ -25,6 +25,8 @@ const PASS_LOGITS: usize = 64;
 const CONTEXT: usize = 4096;
 /// The timed passes of each case, after one pass to warm
 const ITERS: usize = 8;
+/// Milliseconds in a second, for the times of a pass
+const MS_PER_S: f64 = 1e3;
 /// Each case: the sequences of a pass, the tokens of each sequence, and the
 /// idle sequences of the batch. The first case is the reference: one token
 /// of one sequence.
@@ -116,18 +118,32 @@ fn main() {
         pass(&mut *batch);
         let start = Instant::now();
         let gpu_start = batch.gpu_time();
+        let host_start = batch.host_time();
         for _ in 0..ITERS {
             pass(&mut *batch);
         }
-        let ms = start.elapsed().as_secs_f64() * 1e3 / ITERS as f64;
+        let per_pass = |d: Duration| d.as_secs_f64() * MS_PER_S / ITERS as f64;
+        let ms = per_pass(start.elapsed());
         let gpu_ms = match (gpu_start, batch.gpu_time()) {
-            (Some(a), Some(b)) => format!("{:7.2}", (b - a).as_secs_f64() * 1e3 / ITERS as f64),
+            (Some(a), Some(b)) => format!("{:7.2}", per_pass(b - a)),
             _ => "no device clock".into(),
+        };
+        let host_ms = match (host_start, batch.host_time()) {
+            (Some(a), Some(b)) => {
+                let h = b.since(a);
+                format!(
+                    "encode {:7.2} wait {:7.2} readback {:7.2}",
+                    per_pass(h.encode),
+                    per_pass(h.wait),
+                    per_pass(h.readback)
+                )
+            }
+            _ => "no command buffers".into(),
         };
         let base = *reference.get_or_insert(ms);
         println!(
             "seqs={seqs:2} tokens={tokens:2} idle={idle:2} rows={:3}: {ms:7.2} ms a pass, \
-             {:5.2}x one token, GPU {gpu_ms} ms",
+             {:5.2}x one token, GPU {gpu_ms} ms, host {host_ms} ms",
             seqs * tokens,
             ms / base
         );

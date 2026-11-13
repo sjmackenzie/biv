@@ -26,7 +26,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crate::Error;
-use crate::engine::{self, Batch, DraftLogits, Engine, Pass, SeqId, Session, Snapshot, Work};
+use crate::engine::{
+    self, Batch, DraftLogits, Engine, HostTime, Pass, SeqId, Session, Snapshot, Work,
+};
 use crate::memory::{DeviceMemory, ModelMemory, SessionMemory};
 use crate::prelude::*;
 use crate::tokenizer::TokenId;
@@ -95,6 +97,7 @@ pub fn serve<R: Send>(
         }),
     };
     let pass_gpu_time = batch.gpu_time().map(|_| Duration::ZERO);
+    let pass_host_time = batch.host_time().map(|_| HostTime::ZERO);
     Ok(std::thread::scope(|scope| {
         let user = scope.spawn(move || f(handle));
         Scheduler {
@@ -112,9 +115,12 @@ pub fn serve<R: Send>(
                 sequences: 0,
                 pass_time: Duration::ZERO,
                 pass_gpu_time,
+                pass_host_time,
                 drafts: 0,
                 draft_tokens: 0,
                 draft_time: Duration::ZERO,
+                draft_picks: 0,
+                draft_pick_time: Duration::ZERO,
                 widest_decode: 0,
             },
         }
@@ -149,6 +155,11 @@ pub struct Passes {
     /// the device time of the passes, a part of `pass_time`, or None when
     /// the engine has no device clock ([`Batch::gpu_time`])
     pub pass_gpu_time: Option<Duration>,
+    /// the host time of the passes by part, a part of `pass_time`, or None
+    /// when the engine has no command buffers ([`Batch::host_time`]). What
+    /// `pass_time` holds past the parts is the work of a pass before its
+    /// command buffer, and past its readback.
+    pub pass_host_time: Option<HostTime>,
     /// the drafts that the scheduler served: each one runs for one sequence,
     /// outside the passes
     pub drafts: u64,
@@ -156,6 +167,11 @@ pub struct Passes {
     pub draft_tokens: u64,
     /// the time of the engine in those drafts, with the picks of their chats
     pub draft_time: Duration,
+    /// the picks of those drafts: each one a round trip of the logits of a
+    /// drafted token to its chat and of its pick back
+    pub draft_picks: u64,
+    /// the time of those round trips, a part of `draft_time`
+    pub draft_pick_time: Duration,
     /// the most decode rows of one pass
     pub widest_decode: u64,
 }
@@ -579,17 +595,25 @@ impl Scheduler<'_, '_> {
                     return;
                 }
                 let start = Instant::now();
+                let (mut pick_count, mut pick_time) = (0, Duration::ZERO);
                 let drafts = b.draft(seq, next, n, &mut |l| {
+                    let round_trip = Instant::now();
                     let msg = DraftMsg::Logits {
                         logits: l.logits.to_vec(),
                         tokens: l.tokens.map(<[TokenId]>::to_vec),
                     };
                     // a chat gone takes any token
-                    if reply.send(msg).is_err() {
-                        return 0;
-                    }
-                    picks.recv().unwrap_or(0)
+                    let pick = if reply.send(msg).is_err() {
+                        0
+                    } else {
+                        picks.recv().unwrap_or(0)
+                    };
+                    pick_count += 1;
+                    pick_time += round_trip.elapsed();
+                    pick
                 });
+                self.passes.draft_picks += pick_count;
+                self.passes.draft_pick_time += pick_time;
                 self.passes.drafts += 1;
                 self.passes.draft_tokens += drafts.len() as u64;
                 self.passes.draft_time += start.elapsed();
@@ -705,6 +729,7 @@ impl Scheduler<'_, '_> {
             .collect();
         let start = Instant::now();
         let gpu_before = self.batch.gpu_time();
+        let host_before = self.batch.host_time();
         let out = self.batch.run(&work);
         self.passes.pass_time += start.elapsed();
         if let (Some(total), Some(before), Some(after)) = (
@@ -713,6 +738,13 @@ impl Scheduler<'_, '_> {
             self.batch.gpu_time(),
         ) {
             *total += after - before;
+        }
+        if let (Some(total), Some(before), Some(after)) = (
+            self.passes.pass_host_time.as_mut(),
+            host_before,
+            self.batch.host_time(),
+        ) {
+            *total = total.plus(after.since(before));
         }
         // a sequence has at most one request in the queue, so each piece is
         // the tokens of another sequence
