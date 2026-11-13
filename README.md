@@ -395,6 +395,17 @@ chats, `ChatOptions::draft` at 0 or 1 is faster.
   with exact one-hot answers (178, 3149, 11194 and 11728 rows), every
   row of `examples/logits --engine metal` was exact with A and with B, in
   the same time within 0.6 s.
+- The CPU and Metal greedy answers can differ. On an Apple M3 Max on
+  2026-11-13, the plain command line on Qwen3.8 27B Q4_1 (`--no-think -n 128
+  --seed 42 -p "Name three prime numbers above 100."`) gave the same first
+  78 bytes on both engines, and then the first token of line 7 differed:
+  `### Verification` on the CPU (16 threads, 1 draft) and
+  `**Verification:**` on Metal (4 drafts). The CPU text came from biv
+  0fd9232 and from the CPU math of 1744aa7, with the same bytes, so the
+  CPU math of 1744aa7 is not the cause. The cause is not measured: the
+  Metal logits differ from the CPU logits by the f16 KV cache and the
+  half-precision matmul tiles (see `examples/compare.rs` above), and this
+  token can be a near tie.
 
 ## Performance (M2 Max 38-core GPU, Q4_1)
 
