@@ -132,9 +132,12 @@ fn main() {
             (Some(a), Some(b)) => {
                 let h = b.since(a);
                 format!(
-                    "encode {:7.2} wait {:7.2} readback {:7.2}",
+                    "encode {:7.2} wait {:7.2} (queue {:6.2} schedule {:6.2} completion {:6.2}) readback {:7.2}",
                     per_pass(h.encode),
                     per_pass(h.wait),
+                    per_pass(h.queue),
+                    per_pass(h.schedule),
+                    per_pass(h.completion),
                     per_pass(h.readback)
                 )
             }

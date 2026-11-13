@@ -106,6 +106,16 @@ pub struct HostTime {
     /// the copies of the rows of logits of each pass out of the shared
     /// buffer, after its wait
     pub readback: core::time::Duration,
+    /// the first part of the wait: from the commit of each command buffer to
+    /// the time that the driver began to schedule it
+    pub queue: core::time::Duration,
+    /// the second part of the wait: from that time to the start of the
+    /// command buffer on the device. The third part is the device time of
+    /// [`Batch::gpu_time`].
+    pub schedule: core::time::Duration,
+    /// the last part of the wait: from the end of each command buffer on the
+    /// device to the return of the wait for it
+    pub completion: core::time::Duration,
 }
 
 impl HostTime {
@@ -114,6 +124,9 @@ impl HostTime {
         encode: core::time::Duration::ZERO,
         wait: core::time::Duration::ZERO,
         readback: core::time::Duration::ZERO,
+        queue: core::time::Duration::ZERO,
+        schedule: core::time::Duration::ZERO,
+        completion: core::time::Duration::ZERO,
     };
 
     /// The host time from `before` to this one
@@ -122,6 +135,9 @@ impl HostTime {
             encode: self.encode - before.encode,
             wait: self.wait - before.wait,
             readback: self.readback - before.readback,
+            queue: self.queue - before.queue,
+            schedule: self.schedule - before.schedule,
+            completion: self.completion - before.completion,
         }
     }
 
@@ -131,6 +147,9 @@ impl HostTime {
             encode: self.encode + other.encode,
             wait: self.wait + other.wait,
             readback: self.readback + other.readback,
+            queue: self.queue + other.queue,
+            schedule: self.schedule + other.schedule,
+            completion: self.completion + other.completion,
         }
     }
 }
@@ -597,15 +616,18 @@ mod tests {
     use core::time::Duration;
 
     /// Host times of two reads of the counters, in milliseconds
-    const BEFORE_MS: [u64; 3] = [3, 5, 7];
-    const AFTER_MS: [u64; 3] = [4, 9, 8];
+    const BEFORE_MS: [u64; 6] = [3, 5, 7, 1, 2, 3];
+    const AFTER_MS: [u64; 6] = [4, 9, 8, 2, 4, 6];
 
-    fn time(ms: [u64; 3]) -> HostTime {
-        let [encode, wait, readback] = ms.map(Duration::from_millis);
+    fn time(ms: [u64; 6]) -> HostTime {
+        let [encode, wait, readback, queue, schedule, completion] = ms.map(Duration::from_millis);
         HostTime {
             encode,
             wait,
             readback,
+            queue,
+            schedule,
+            completion,
         }
     }
 
@@ -613,7 +635,7 @@ mod tests {
     fn a_host_time_since_an_earlier_one_adds_back_to_it() {
         let (before, after) = (time(BEFORE_MS), time(AFTER_MS));
         let pass = after.since(before);
-        assert_eq!(pass, time([1, 4, 1]));
+        assert_eq!(pass, time([1, 4, 1, 1, 2, 3]));
         assert_eq!(before.plus(pass), after);
         assert_eq!(HostTime::ZERO.plus(pass), pass);
     }

@@ -539,6 +539,66 @@ pub struct MetalEngine<'m> {
     encode_nanos: AtomicU64,
     wait_nanos: AtomicU64,
     readback_nanos: AtomicU64,
+    queue_nanos: AtomicU64,
+    schedule_nanos: AtomicU64,
+    completion_nanos: AtomicU64,
+    /// the units of the host clock of Metal, for its times in seconds
+    host_clock: HostClock,
+}
+
+/// The ratio of mach_absolute_time to nanoseconds
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+}
+
+/// The host clock of the times that Metal gives for a command buffer: the
+/// seconds of mach_absolute_time
+#[derive(Clone, Copy, Debug)]
+struct HostClock {
+    timebase: MachTimebaseInfo,
+}
+
+/// The seconds of a nanosecond
+const SECONDS_PER_NANO: f64 = 1e-9;
+
+impl HostClock {
+    fn new() -> Self {
+        let mut timebase = MachTimebaseInfo::default();
+        // SAFETY: mach_timebase_info writes the struct that it is given
+        let status = unsafe { mach_timebase_info(&mut timebase) };
+        assert!(
+            status == 0 && timebase.denom != 0,
+            "metal: MachTimebaseUnknown: mach_timebase_info gave {status}"
+        );
+        HostClock { timebase }
+    }
+
+    /// The time now, in the seconds of the times of Metal
+    fn now(&self) -> f64 {
+        // SAFETY: mach_absolute_time reads a clock and takes no argument
+        let ticks = unsafe { mach_absolute_time() };
+        let nanos = ticks as f64 * f64::from(self.timebase.numer) / f64::from(self.timebase.denom);
+        nanos * SECONDS_PER_NANO
+    }
+}
+
+/// The time from `from` to `to`, in seconds of one clock. A time of 0 is a
+/// time that Metal did not give, and an end before its start is not a
+/// time: both fail by name.
+fn interval(part: &str, from: f64, to: f64) -> Duration {
+    assert!(
+        from > 0.0 && to >= from,
+        "metal: CommandBufferTimeMissing: {part} from {from} to {to}"
+    );
+    Duration::from_secs_f64(to - from)
 }
 
 /// Add `time` to the nanoseconds of `counter`
@@ -793,6 +853,10 @@ impl<'m> MetalEngine<'m> {
             encode_nanos: AtomicU64::new(0),
             wait_nanos: AtomicU64::new(0),
             readback_nanos: AtomicU64::new(0),
+            queue_nanos: AtomicU64::new(0),
+            schedule_nanos: AtomicU64::new(0),
+            completion_nanos: AtomicU64::new(0),
+            host_clock: HostClock::new(),
         })
     }
 
@@ -1652,9 +1716,13 @@ impl MetalEngine<'_> {
             .expect("metal: no compute encoder");
         encode(&enc);
         enc.endEncoding();
+        // the clock of Metal before the commit: the driver can begin to
+        // schedule the command buffer inside the call
+        let committed_s = self.host_clock.now();
         cb.commit();
         let committed = Instant::now();
         cb.waitUntilCompleted();
+        let returned_s = self.host_clock.now();
         add_time(&self.wait_nanos, committed.elapsed());
         add_time(&self.encode_nanos, committed - start);
         if cb.status() == MTLCommandBufferStatus::Error {
@@ -1664,8 +1732,21 @@ impl MetalEngine<'_> {
                 .unwrap_or_default();
             panic!("metal: command buffer failed: {msg}");
         }
-        let seconds = cb.GPUEndTime() - cb.GPUStartTime();
-        add_time(&self.gpu_nanos, Duration::from_secs_f64(seconds));
+        let (kernel_start, gpu_start, gpu_end) =
+            (cb.kernelStartTime(), cb.GPUStartTime(), cb.GPUEndTime());
+        add_time(
+            &self.queue_nanos,
+            interval("queue", committed_s, kernel_start),
+        );
+        add_time(
+            &self.schedule_nanos,
+            interval("schedule", kernel_start, gpu_start),
+        );
+        add_time(&self.gpu_nanos, interval("gpu", gpu_start, gpu_end));
+        add_time(
+            &self.completion_nanos,
+            interval("completion", gpu_end, returned_s),
+        );
     }
 
     /// The GPU time of all command buffers of the engine since it started
@@ -1679,6 +1760,9 @@ impl MetalEngine<'_> {
             encode: time_of(&self.encode_nanos),
             wait: time_of(&self.wait_nanos),
             readback: time_of(&self.readback_nanos),
+            queue: time_of(&self.queue_nanos),
+            schedule: time_of(&self.schedule_nanos),
+            completion: time_of(&self.completion_nanos),
         }
     }
 
