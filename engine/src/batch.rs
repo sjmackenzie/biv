@@ -94,6 +94,7 @@ pub fn serve<R: Send>(
             numerics,
         }),
     };
+    let pass_gpu_time = batch.gpu_time().map(|_| Duration::ZERO);
     Ok(std::thread::scope(|scope| {
         let user = scope.spawn(move || f(handle));
         Scheduler {
@@ -110,6 +111,7 @@ pub fn serve<R: Send>(
                 tokens: 0,
                 sequences: 0,
                 pass_time: Duration::ZERO,
+                pass_gpu_time,
                 drafts: 0,
                 draft_tokens: 0,
                 draft_time: Duration::ZERO,
@@ -144,6 +146,9 @@ pub struct Passes {
     pub sequences: u64,
     /// the time of the engine in the passes
     pub pass_time: Duration,
+    /// the device time of the passes, a part of `pass_time`, or None when
+    /// the engine has no device clock ([`Batch::gpu_time`])
+    pub pass_gpu_time: Option<Duration>,
     /// the drafts that the scheduler served: each one runs for one sequence,
     /// outside the passes
     pub drafts: u64,
@@ -699,8 +704,16 @@ impl Scheduler<'_, '_> {
             })
             .collect();
         let start = Instant::now();
+        let gpu_before = self.batch.gpu_time();
         let out = self.batch.run(&work);
         self.passes.pass_time += start.elapsed();
+        if let (Some(total), Some(before), Some(after)) = (
+            self.passes.pass_gpu_time.as_mut(),
+            gpu_before,
+            self.batch.gpu_time(),
+        ) {
+            *total += after - before;
+        }
         // a sequence has at most one request in the queue, so each piece is
         // the tokens of another sequence
         self.passes.passes += 1;

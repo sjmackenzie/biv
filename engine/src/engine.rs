@@ -127,6 +127,12 @@ pub trait Batch {
     /// Tokens of a pass, at most
     fn max_tokens(&self) -> usize;
 
+    /// The time that the device of the engine spent on the work of this
+    /// batch's engine since it started, or None when the engine has no
+    /// device clock. A difference over a pass is the device time of the
+    /// pass.
+    fn gpu_time(&self) -> Option<core::time::Duration>;
+
     /// Rows of logits of a pass, at most
     fn max_logits(&self) -> usize;
 
@@ -190,6 +196,10 @@ impl<'e> Sequential<'e> {
 }
 
 impl Batch for Sequential<'_> {
+    fn gpu_time(&self) -> Option<core::time::Duration> {
+        None
+    }
+
     fn add(&mut self, context: usize, draft: usize) -> Result<SeqId, Error> {
         let session = self.engine.new_session(context, draft)?;
         Ok(insert(&mut self.seqs, session))

@@ -5,6 +5,8 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -520,6 +522,8 @@ pub struct MetalEngine<'m> {
     max_batch: usize,
     /// Matmul inputs of up to this many rows use the `mmv` kernels
     mmv_max_rows: usize,
+    /// The GPU time of all command buffers of the engine, in nanoseconds
+    gpu_nanos: AtomicU64,
 }
 
 fn upload(device: &Device, data: &[f32]) -> Result<Buffer, Error> {
@@ -760,6 +764,7 @@ impl<'m> MetalEngine<'m> {
             mtp,
             max_batch: max_batch.max(1),
             mmv_max_rows,
+            gpu_nanos: AtomicU64::new(0),
         })
     }
 
@@ -1627,6 +1632,16 @@ impl MetalEngine<'_> {
                 .unwrap_or_default();
             panic!("metal: command buffer failed: {msg}");
         }
+        let seconds = cb.GPUEndTime() - cb.GPUStartTime();
+        self.gpu_nanos.fetch_add(
+            Duration::from_secs_f64(seconds).as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The GPU time of all command buffers of the engine since it started
+    pub fn gpu_time(&self) -> Duration {
+        Duration::from_nanos(self.gpu_nanos.load(Ordering::Relaxed))
     }
 
     /// One pass of the tokens of several sequences, with the activations in
@@ -2483,6 +2498,10 @@ impl MetalBatch<'_> {
 }
 
 impl Batch for MetalBatch<'_> {
+    fn gpu_time(&self) -> Option<Duration> {
+        Some(self.e.gpu_time())
+    }
+
     fn add(&mut self, context: usize, draft: usize) -> Result<SeqId, Error> {
         let seq = Seq::new(self.e, context, draft, self.s.batch)?;
         Ok(insert(&mut self.seqs, seq))

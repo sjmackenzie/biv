@@ -3,13 +3,14 @@
 //!
 //! Each sequence holds the same prompt. A pass is a verify of `tokens`
 //! tokens for each of `seqs` sequences, which gives logits for every token,
-//! as a decode step with drafts does. Each case runs one pass to warm, then
-//! `ITERS` timed passes, and prints the mean time of a pass and its ratio to
-//! a pass of one token of one sequence.
+//! as a decode step with drafts does. `idle` more sequences hold the prompt
+//! in the batch but are not in the pass. Each case runs one pass to warm,
+//! then `ITERS` timed passes, and prints the mean time of a pass, its ratio
+//! to a pass of one token of one sequence, and the GPU time of a pass.
 use std::time::Instant;
 
 use biv::{
-    engine::{self, Engine, Pass, Work},
+    engine::{self, Batch, Engine, Pass, Work},
     model::Model,
     tokenizer::Tokenizer,
 };
@@ -24,29 +25,46 @@ const PASS_LOGITS: usize = 64;
 const CONTEXT: usize = 4096;
 /// The timed passes of each case, after one pass to warm
 const ITERS: usize = 8;
-/// Each case: the sequences of a pass and the tokens of each sequence. The
-/// first case is the reference: one token of one sequence.
-const CASES: [(usize, usize); 20] = [
-    (1, 1),
-    (1, 2),
-    (1, 3),
-    (1, 4),
-    (1, 6),
-    (1, 8),
-    (1, 12),
-    (1, 16),
-    (1, 17),
-    (1, 24),
-    (1, 32),
-    (1, 48),
-    (2, 1),
-    (4, 1),
-    (8, 1),
-    (16, 1),
-    (2, 6),
-    (3, 6),
-    (4, 6),
-    (8, 6),
+/// Each case: the sequences of a pass, the tokens of each sequence, and the
+/// idle sequences of the batch. The first case is the reference: one token
+/// of one sequence.
+const CASES: [(usize, usize, usize); 32] = [
+    (1, 1, 0),
+    (1, 2, 0),
+    (1, 3, 0),
+    (1, 4, 0),
+    (1, 6, 0),
+    (1, 8, 0),
+    (1, 12, 0),
+    (1, 16, 0),
+    (1, 17, 0),
+    (1, 24, 0),
+    (1, 32, 0),
+    (1, 48, 0),
+    // sequences of one row
+    (2, 1, 0),
+    (4, 1, 0),
+    (6, 1, 0),
+    (8, 1, 0),
+    (12, 1, 0),
+    (16, 1, 0),
+    (24, 1, 0),
+    (32, 1, 0),
+    // sequences with drafts
+    (2, 6, 0),
+    (3, 6, 0),
+    (4, 6, 0),
+    (8, 6, 0),
+    // about 30 rows in other shapes
+    (6, 5, 0),
+    (8, 4, 0),
+    (16, 2, 0),
+    (30, 1, 0),
+    // the same pass with idle sequences in the batch
+    (6, 5, 10),
+    (6, 5, 26),
+    (16, 2, 16),
+    (1, 1, 31),
 ];
 
 fn main() {
@@ -65,12 +83,15 @@ fn main() {
     let prompt = tok.encode(PROMPT);
     let mut batch = engine::new_batch(engine, PASS_TOKENS, PASS_LOGITS).unwrap();
     let mut reference = None;
-    for (seqs, tokens) in CASES {
+    for (seqs, tokens, idle) in CASES {
         let ids: Vec<usize> = (0..seqs)
             // a sequence verifies its drafts and one token more
             .map(|_| batch.add(CONTEXT, tokens - 1).unwrap())
             .collect();
-        for &seq in &ids {
+        let idle_ids: Vec<usize> = (0..idle)
+            .map(|_| batch.add(CONTEXT, tokens - 1).unwrap())
+            .collect();
+        for &seq in ids.iter().chain(&idle_ids) {
             batch.run(&[Work {
                 seq,
                 tokens: &prompt,
@@ -86,25 +107,31 @@ fn main() {
                 pass: Pass::Verify,
             })
             .collect();
-        let mut pass = || {
+        let pass = |batch: &mut dyn Batch| {
             batch.run(&work);
             for &seq in &ids {
                 batch.keep(seq, tokens);
             }
         };
-        pass();
+        pass(&mut *batch);
         let start = Instant::now();
+        let gpu_start = batch.gpu_time();
         for _ in 0..ITERS {
-            pass();
+            pass(&mut *batch);
         }
         let ms = start.elapsed().as_secs_f64() * 1e3 / ITERS as f64;
+        let gpu_ms = match (gpu_start, batch.gpu_time()) {
+            (Some(a), Some(b)) => format!("{:7.2}", (b - a).as_secs_f64() * 1e3 / ITERS as f64),
+            _ => "no device clock".into(),
+        };
         let base = *reference.get_or_insert(ms);
         println!(
-            "seqs={seqs:2} tokens={tokens:2} rows={:3}: {ms:7.2} ms a pass, {:5.2}x one token",
+            "seqs={seqs:2} tokens={tokens:2} idle={idle:2} rows={:3}: {ms:7.2} ms a pass, \
+             {:5.2}x one token, GPU {gpu_ms} ms",
             seqs * tokens,
             ms / base
         );
-        for seq in ids {
+        for seq in ids.into_iter().chain(idle_ids) {
             batch.remove(seq);
         }
     }
