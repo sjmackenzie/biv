@@ -3,7 +3,6 @@
 
 use core::cell::OnceCell;
 
-#[cfg(not(any(feature = "std", test)))]
 use crate::math::Float;
 use crate::par::{self, *};
 use crate::prelude::*;
@@ -167,10 +166,10 @@ pub const SIGMOID_OVERFLOW_X: f32 = -80.0;
 #[inline]
 pub fn sigmoid(x: f32) -> f32 {
     if x < SIGMOID_OVERFLOW_X {
-        let e = x.exp();
+        let e = Float::exp(x);
         e / (1.0 + e)
     } else {
-        1.0 / (1.0 + (-x).exp())
+        1.0 / (1.0 + Float::exp(-x))
     }
 }
 
@@ -182,7 +181,11 @@ pub fn silu(x: f32) -> f32 {
 #[inline]
 pub fn softplus(x: f32) -> f32 {
     // same threshold as ggml
-    if x > 20.0 { x } else { x.exp().ln_1p() }
+    if x > 20.0 {
+        x
+    } else {
+        Float::ln_1p(Float::exp(x))
+    }
 }
 
 pub fn add_inplace(x: &mut [f32], y: &[f32]) {
@@ -206,7 +209,7 @@ pub fn softmax(x: &mut [f32]) {
     let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0;
     for v in x.iter_mut() {
-        *v = (*v - max).exp();
+        *v = Float::exp(*v - max);
         sum += *v;
     }
     let inv = 1.0 / sum;
@@ -226,7 +229,7 @@ mod tests {
     fn sigmoid_keeps_the_ggml_form_at_and_above_the_overflow_input() {
         let mut x = SIGMOID_OVERFLOW_X;
         while x < -SIGMOID_OVERFLOW_X {
-            let ggml = 1.0 / (1.0 + (-x).exp());
+            let ggml = 1.0 / (1.0 + Float::exp(-x));
             assert_eq!(sigmoid(x).to_bits(), ggml.to_bits(), "x = {x}");
             assert_eq!(silu(x).to_bits(), (x * ggml).to_bits(), "x = {x}");
             x += STEP;

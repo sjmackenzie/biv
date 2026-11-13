@@ -2,7 +2,6 @@
 
 use crate::Error;
 use crate::gguf::Gguf;
-#[cfg(not(any(feature = "std", test)))]
 use crate::math::Float;
 use crate::prelude::*;
 use crate::tokenizer::TokenId;
@@ -286,7 +285,7 @@ impl Sampler {
         let max = cand[0].1;
         let mut sum = 0.0;
         for (_, l) in cand.iter_mut() {
-            *l = ((*l - max) / c.temperature).exp();
+            *l = Float::exp((*l - max) / c.temperature);
             sum += *l;
         }
         for (_, p) in cand.iter_mut() {
