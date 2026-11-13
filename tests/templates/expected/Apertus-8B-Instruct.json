@@ -35,17 +35,12 @@
   },
   {
    "case": "reasoned_answer",
-   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>7<|assistant_end|><|user_start|>Name one more.<|user_end|><|assistant_start|>",
+   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>7<|assistant_end|><|user_start|>Name one more.<|user_end|><|assistant_start|>",
    "needs_undefined": false
   },
   {
    "case": "reasoned_answer_not_preserved",
-   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>7<|assistant_end|><|user_start|>Name one more.<|user_end|><|assistant_start|>",
-   "needs_undefined": false
-  },
-  {
-   "case": "thinking_off",
-   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>",
+   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>7<|assistant_end|><|user_start|>Name one more.<|user_end|><|assistant_start|>",
    "needs_undefined": false
   },
   {
@@ -55,17 +50,17 @@
   },
   {
    "case": "effort_low",
-   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>",
+   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>",
    "needs_undefined": false
   },
   {
    "case": "effort_medium",
-   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>",
+   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>",
    "needs_undefined": false
   },
   {
    "case": "effort_xhigh",
-   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>",
+   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>",
    "needs_undefined": false
   },
   {

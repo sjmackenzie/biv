@@ -44,11 +44,6 @@
    "needs_undefined": false
   },
   {
-   "case": "thinking_off",
-   "output": "<seed:bos>user\nName a prime number.<seed:eos><seed:bos>assistant\n",
-   "needs_undefined": false
-  },
-  {
    "case": "thinking_on",
    "output": "<seed:bos>user\nName a prime number.<seed:eos><seed:bos>assistant\n",
    "needs_undefined": false

@@ -44,11 +44,6 @@
    "needs_undefined": false
   },
   {
-   "case": "thinking_off",
-   "output": "<BOS><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 05 Jan 2026\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName a prime number.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
-   "needs_undefined": false
-  },
-  {
    "case": "thinking_on",
    "output": "<BOS><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 05 Jan 2026\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName a prime number.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
    "needs_undefined": false

@@ -44,11 +44,6 @@
    "needs_undefined": true
   },
   {
-   "case": "thinking_off",
-   "output": "<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is 2026-01-05.<|end|><|begin|>user<|content|>Name a prime number.<|end|><|begin|>assistant",
-   "needs_undefined": true
-  },
-  {
    "case": "thinking_on",
    "output": "<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is 2026-01-05.<|end|><|begin|>user<|content|>Name a prime number.<|end|><|begin|>assistant",
    "needs_undefined": true

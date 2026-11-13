@@ -35,18 +35,13 @@
   },
   {
    "case": "reasoned_answer",
-   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think></think>7<｜end▁of▁sentence｜><｜User｜>Name one more.<｜Assistant｜><think></think>",
+   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think></think>7<｜end▁of▁sentence｜><｜User｜>Name one more.<｜Assistant｜><think>",
    "needs_undefined": true
   },
   {
    "case": "reasoned_answer_not_preserved",
-   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think></think>7<｜end▁of▁sentence｜><｜User｜>Name one more.<｜Assistant｜><think></think>",
+   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think></think>7<｜end▁of▁sentence｜><｜User｜>Name one more.<｜Assistant｜><think>",
    "needs_undefined": true
-  },
-  {
-   "case": "thinking_off",
-   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think></think>",
-   "needs_undefined": false
   },
   {
    "case": "thinking_on",
@@ -55,17 +50,17 @@
   },
   {
    "case": "effort_low",
-   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think></think>",
+   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think>",
    "needs_undefined": false
   },
   {
    "case": "effort_medium",
-   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think></think>",
+   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think>",
    "needs_undefined": false
   },
   {
    "case": "effort_xhigh",
-   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think></think>",
+   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think>",
    "needs_undefined": false
   },
   {

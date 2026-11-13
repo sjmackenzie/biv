@@ -44,11 +44,6 @@
    "needs_undefined": false
   },
   {
-   "case": "thinking_off",
-   "output": "<BOS><|start_header_id|>system<|end_header_id|>\n\nYou are capable of executing available function(s) if required.\nOnly execute function(s) when absolutely necessary.\nAsk for the required input to:recipient==all\nUse JSON for function arguments.\nRespond in this format:\n>>>${recipient}\n${content}\nAvailable functions:\n// Supported function definitions that should be called when necessary.\nnamespace functions {\n\n} // namespace functions<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName a prime number.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n>>>",
-   "needs_undefined": false
-  },
-  {
    "case": "thinking_on",
    "output": "<BOS><|start_header_id|>system<|end_header_id|>\n\nYou are capable of executing available function(s) if required.\nOnly execute function(s) when absolutely necessary.\nAsk for the required input to:recipient==all\nUse JSON for function arguments.\nRespond in this format:\n>>>${recipient}\n${content}\nAvailable functions:\n// Supported function definitions that should be called when necessary.\nnamespace functions {\n\n} // namespace functions<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName a prime number.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n>>>",
    "needs_undefined": false

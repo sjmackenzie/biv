@@ -44,11 +44,6 @@
    "needs_undefined": false
   },
   {
-   "case": "thinking_off",
-   "output": "<|user|>\nName a prime number.<|end|>\n<|assistant|>\n",
-   "needs_undefined": false
-  },
-  {
    "case": "thinking_on",
    "output": "<|user|>\nName a prime number.<|end|>\n<|assistant|>\n",
    "needs_undefined": false

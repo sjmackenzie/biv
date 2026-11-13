@@ -44,11 +44,6 @@
    "needs_undefined": false
   },
   {
-   "case": "thinking_off",
-   "output": "<BOS><start_of_turn>user\nName a prime number.<end_of_turn>\n<start_of_turn>model\n",
-   "needs_undefined": false
-  },
-  {
    "case": "thinking_on",
    "output": "<BOS><start_of_turn>user\nName a prime number.<end_of_turn>\n<start_of_turn>model\n",
    "needs_undefined": false

@@ -88,6 +88,23 @@ def extract(gguf, out):
     raise SystemExit(f"ChatTemplateMissing: {gguf}")
 
 
+# The variables that biv sets in every render. biv sets reasoning_effort
+# only when enable_thinking is true: the effort none has no level.
+BIV_VARIABLES = {"bos_token", "eos_token", "enable_thinking", "preserve_thinking"}
+EFFORT_VARIABLE = "reasoning_effort"
+THINKING_VARIABLE = "enable_thinking"
+
+
+def check_case(case):
+    """Refuse a case whose variables are not those that biv sets"""
+    names = set(case["variables"])
+    expected = set(BIV_VARIABLES)
+    if case["variables"].get(THINKING_VARIABLE) is True:
+        expected.add(EFFORT_VARIABLE)
+    if names != expected:
+        raise SystemExit(f"CaseVariablesOther: {case['name']}: {sorted(names)}, expected {sorted(expected)}")
+
+
 class FixedClock(datetime):
     @classmethod
     def now(cls, tz=None):
@@ -105,6 +122,8 @@ def render_all():
         )
     chat.datetime = FixedClock
     cases = json.loads(CONVERSATIONS.read_text(encoding="utf-8"))["cases"]
+    for case in cases:
+        check_case(case)
     EXPECTED.mkdir(exist_ok=True)
     for path in sorted(CORPUS.glob("*.jinja")):
         template = path.read_text(encoding="utf-8")
@@ -129,7 +148,7 @@ def render_all():
 def render_case(chat, template, case):
     import jinja2
 
-    args = dict(case.get("variables", {}))
+    args = dict(case["variables"])
     args["add_generation_prompt"] = case["add_generation_prompt"]
     tools = case.get("tools")
     result = {"case": case["name"]}

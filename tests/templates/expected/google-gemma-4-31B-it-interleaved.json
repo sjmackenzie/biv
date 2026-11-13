@@ -35,17 +35,12 @@
   },
   {
    "case": "reasoned_answer",
-   "output": "<BOS><|turn>user\nName a prime number.<turn|>\n<|turn>model\n7<turn|>\n<|turn>user\nName one more.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "output": "<BOS><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nName a prime number.<turn|>\n<|turn>model\n7<turn|>\n<|turn>user\nName one more.<turn|>\n<|turn>model\n",
    "needs_undefined": true
   },
   {
    "case": "reasoned_answer_not_preserved",
-   "output": "<BOS><|turn>user\nName a prime number.<turn|>\n<|turn>model\n7<turn|>\n<|turn>user\nName one more.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
-   "needs_undefined": true
-  },
-  {
-   "case": "thinking_off",
-   "output": "<BOS><|turn>user\nName a prime number.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "output": "<BOS><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nName a prime number.<turn|>\n<|turn>model\n7<turn|>\n<|turn>user\nName one more.<turn|>\n<|turn>model\n",
    "needs_undefined": true
   },
   {
@@ -55,17 +50,17 @@
   },
   {
    "case": "effort_low",
-   "output": "<BOS><|turn>user\nName a prime number.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "output": "<BOS><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nName a prime number.<turn|>\n<|turn>model\n",
    "needs_undefined": true
   },
   {
    "case": "effort_medium",
-   "output": "<BOS><|turn>user\nName a prime number.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "output": "<BOS><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nName a prime number.<turn|>\n<|turn>model\n",
    "needs_undefined": true
   },
   {
    "case": "effort_xhigh",
-   "output": "<BOS><|turn>user\nName a prime number.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "output": "<BOS><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nName a prime number.<turn|>\n<|turn>model\n",
    "needs_undefined": true
   },
   {

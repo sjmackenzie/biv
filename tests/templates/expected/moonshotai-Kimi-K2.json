@@ -44,11 +44,6 @@
    "needs_undefined": false
   },
   {
-   "case": "thinking_off",
-   "output": "<|im_system|>system<|im_middle|>You are a helpful assistant<|im_end|><|im_user|>user<|im_middle|>Name a prime number.<|im_end|><|im_assistant|>assistant<|im_middle|>",
-   "needs_undefined": false
-  },
-  {
    "case": "thinking_on",
    "output": "<|im_system|>system<|im_middle|>You are a helpful assistant<|im_end|><|im_user|>user<|im_middle|>Name a prime number.<|im_end|><|im_assistant|>assistant<|im_middle|>",
    "needs_undefined": false

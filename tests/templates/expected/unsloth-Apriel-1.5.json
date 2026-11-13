@@ -44,11 +44,6 @@
    "needs_undefined": true
   },
   {
-   "case": "thinking_off",
-   "output": "<BOS><|system|>\nYou are a thoughtful and systematic AI assistant built by ServiceNow Language Models (SLAM) lab. Before providing an answer, analyze the problem carefully and present your reasoning step by step. After explaining your thought process, provide the final solution in the following format: [BEGIN FINAL RESPONSE] ... [END FINAL RESPONSE].\n<|end|>\n<|user|>\nName a prime number.\n<|end|>\n<|assistant|>\n",
-   "needs_undefined": true
-  },
-  {
    "case": "thinking_on",
    "output": "<BOS><|system|>\nYou are a thoughtful and systematic AI assistant built by ServiceNow Language Models (SLAM) lab. Before providing an answer, analyze the problem carefully and present your reasoning step by step. After explaining your thought process, provide the final solution in the following format: [BEGIN FINAL RESPONSE] ... [END FINAL RESPONSE].\n<|end|>\n<|user|>\nName a prime number.\n<|end|>\n<|assistant|>\n",
    "needs_undefined": true

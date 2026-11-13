@@ -35,18 +35,13 @@
   },
   {
    "case": "reasoned_answer",
-   "output": "<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nName one more.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "output": "<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nName one more.<|im_end|>\n<|im_start|>assistant\n<think>\n",
    "needs_undefined": true
   },
   {
    "case": "reasoned_answer_not_preserved",
-   "output": "<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nName one more.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "output": "<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nName one more.<|im_end|>\n<|im_start|>assistant\n<think>\n",
    "needs_undefined": true
-  },
-  {
-   "case": "thinking_off",
-   "output": "<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
-   "needs_undefined": false
   },
   {
    "case": "thinking_on",
@@ -55,17 +50,17 @@
   },
   {
    "case": "effort_low",
-   "output": "<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "output": "<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n<think>\n",
    "needs_undefined": false
   },
   {
    "case": "effort_medium",
-   "output": "<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "output": "<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n<think>\n",
    "needs_undefined": false
   },
   {
    "case": "effort_xhigh",
-   "output": "<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "output": "<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n<think>\n",
    "needs_undefined": false
   },
   {

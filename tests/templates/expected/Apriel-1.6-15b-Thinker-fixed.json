@@ -44,11 +44,6 @@
    "needs_undefined": false
   },
   {
-   "case": "thinking_off",
-   "output": "<BOS><|begin_system|>\nYou are a thoughtful, systematic AI assistant from ServiceNow Language Models (SLAM) lab.\n    Analyze each question carefully, present your reasoning step-by-step, then provide the final\n    response after the marker [BEGIN FINAL RESPONSE].\n<|begin_user|>\nName a prime number.\n<|begin_assistant|>\nHere are my reasoning steps:\n",
-   "needs_undefined": false
-  },
-  {
    "case": "thinking_on",
    "output": "<BOS><|begin_system|>\nYou are a thoughtful, systematic AI assistant from ServiceNow Language Models (SLAM) lab.\n    Analyze each question carefully, present your reasoning step-by-step, then provide the final\n    response after the marker [BEGIN FINAL RESPONSE].\n<|begin_user|>\nName a prime number.\n<|begin_assistant|>\nHere are my reasoning steps:\n",
    "needs_undefined": false

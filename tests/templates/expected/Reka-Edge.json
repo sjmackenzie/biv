@@ -35,18 +35,13 @@
   },
   {
    "case": "reasoned_answer",
-   "output": "human: Name a prime number.<sep>assistant: 7\n\n<sep>human: Name one more.<sep>assistant:",
+   "output": "human: Name a prime number.<sep>assistant: 7\n\n<sep>human: Name one more.<sep>assistant: <think>\n",
    "needs_undefined": true
   },
   {
    "case": "reasoned_answer_not_preserved",
-   "output": "human: Name a prime number.<sep>assistant: 7\n\n<sep>human: Name one more.<sep>assistant:",
+   "output": "human: Name a prime number.<sep>assistant: 7\n\n<sep>human: Name one more.<sep>assistant: <think>\n",
    "needs_undefined": true
-  },
-  {
-   "case": "thinking_off",
-   "output": "human: Name a prime number.<sep>assistant:",
-   "needs_undefined": false
   },
   {
    "case": "thinking_on",
@@ -55,17 +50,17 @@
   },
   {
    "case": "effort_low",
-   "output": "human: Name a prime number.<sep>assistant:",
+   "output": "human: Name a prime number.<sep>assistant: <think>\n",
    "needs_undefined": false
   },
   {
    "case": "effort_medium",
-   "output": "human: Name a prime number.<sep>assistant:",
+   "output": "human: Name a prime number.<sep>assistant: <think>\n",
    "needs_undefined": false
   },
   {
    "case": "effort_xhigh",
-   "output": "human: Name a prime number.<sep>assistant:",
+   "output": "human: Name a prime number.<sep>assistant: <think>\n",
    "needs_undefined": false
   },
   {
