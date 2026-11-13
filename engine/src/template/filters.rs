@@ -71,16 +71,14 @@ pub const REFERENCE_FILTERS: [&str; 52] = [
 ];
 
 /// The filters of the reference that the subset has
-pub const FILTERS: [&str; 24] = [
+pub const FILTERS: [&str; 22] = [
     "count",
     "d",
     "default",
     "dictsort",
-    "first",
     "int",
     "items",
     "join",
-    "last",
     "length",
     "list",
     "lower",
@@ -141,53 +139,25 @@ pub const REFERENCE_TESTS: [&str; 39] = [
     ">=",
 ];
 
-/// The tests of the reference that the subset has: all but escaped
-pub const TESTS: [&str; 38] = [
+/// The tests of the reference that the subset has: those that the corpus uses
+pub const TESTS: [&str; 11] = [
     "boolean",
-    "callable",
     "defined",
-    "divisibleby",
-    "eq",
     "equalto",
-    "even",
     "false",
-    "filter",
-    "float",
-    "ge",
-    "gt",
-    "greaterthan",
-    "in",
-    "integer",
     "iterable",
-    "le",
-    "lessthan",
-    "lower",
-    "lt",
     "mapping",
-    "ne",
     "none",
-    "number",
-    "odd",
-    "sameas",
     "sequence",
     "string",
-    "test",
     "true",
     "undefined",
-    "upper",
-    "==",
-    "!=",
-    "<",
-    "<=",
-    ">",
-    ">=",
 ];
 
 /// The methods of str and dict that the subset has. A call of another
 /// method fails at load.
-pub const METHODS: [&str; 17] = [
+pub const METHODS: [&str; 11] = [
     "split",
-    "rsplit",
     "strip",
     "lstrip",
     "rstrip",
@@ -196,18 +166,12 @@ pub const METHODS: [&str; 17] = [
     "replace",
     "upper",
     "lower",
-    "title",
-    "find",
-    "count",
     "items",
     "get",
-    "keys",
-    "values",
 ];
-const DICT_METHODS: [&str; 4] = ["items", "get", "keys", "values"];
-const STR_METHODS: [&str; 13] = [
+const DICT_METHODS: [&str; 2] = ["items", "get"];
+const STR_METHODS: [&str; 9] = [
     "split",
-    "rsplit",
     "strip",
     "lstrip",
     "rstrip",
@@ -216,9 +180,6 @@ const STR_METHODS: [&str; 13] = [
     "replace",
     "upper",
     "lower",
-    "title",
-    "find",
-    "count",
 ];
 
 /// The whitespace of Python's str.isspace
@@ -290,11 +251,11 @@ pub fn plain(v: &Value, what: &'static str, line: u32) -> Res<()> {
 
 /// obj.attr, as jinja2 gives it: an attribute of Python first (a method),
 /// then an item
-pub fn getattr(obj: &Value, attr: &str, line: u32) -> Value {
-    match obj {
+pub fn getattr(obj: &Value, attr: &str, line: u32) -> Res<Value> {
+    Ok(match obj {
         Value::Map(m) => {
             if DICT_METHODS.contains(&attr) {
-                return Value::Method(Rc::new((obj.clone(), attr.into())));
+                return Ok(Value::Method(Rc::new((obj.clone(), attr.into()))));
             }
             Value::map_get_str(m, attr).unwrap_or_else(|| undefined(attr, line))
         }
@@ -313,18 +274,21 @@ pub fn getattr(obj: &Value, attr: &str, line: u32) -> Value {
             match attr {
                 "index" => Value::Int((i + 1) as i64),
                 "index0" => Value::Int(i as i64),
-                "revindex" => Value::Int((n - i) as i64),
-                "revindex0" => Value::Int((n - i - 1) as i64),
                 "first" => Value::Bool(i == 0),
                 "last" => Value::Bool(i + 1 == n),
                 "length" => Value::Int(n as i64),
                 "previtem" => l.previtem.clone().unwrap_or_else(|| undefined(attr, line)),
                 "nextitem" => l.nextitem.clone().unwrap_or_else(|| undefined(attr, line)),
-                _ => undefined(attr, line),
+                _ => {
+                    return Err(err(
+                        ErrorKind::Unsupported("a loop attribute outside the subset"),
+                        line,
+                    ));
+                }
             }
         }
         _ => undefined(attr, line),
-    }
+    })
 }
 
 /// The index `i` of a sequence of `len`, from its end when negative
@@ -358,7 +322,7 @@ pub fn getitem(obj: &Value, key: &Value, line: u32) -> Res<Value> {
         return Ok(v);
     }
     Ok(match key {
-        Value::Str(k) => getattr(obj, k.as_str(), line),
+        Value::Str(k) => getattr(obj, k.as_str(), line)?,
         other => {
             let mut s = String::new();
             super::value::repr(other, &mut s);
@@ -531,19 +495,6 @@ pub fn binary(op: BinOp, l: Value, r: Value, line: u32) -> Res<Value> {
                 }
                 Value::Float(x as f64 / y as f64)
             }
-            BinOp::FloorDiv => {
-                if y == 0 {
-                    return Err(zero());
-                }
-                Value::Int(
-                    x.div_euclid(y)
-                        - if (x.rem_euclid(y) != 0) && (y < 0) {
-                            1
-                        } else {
-                            0
-                        },
-                )
-            }
             BinOp::Mod => {
                 if y == 0 {
                     return Err(zero());
@@ -554,14 +505,6 @@ pub fn binary(op: BinOp, l: Value, r: Value, line: u32) -> Res<Value> {
                 } else {
                     m
                 })
-            }
-            BinOp::Pow => {
-                if y < 0 {
-                    Value::Float(libm::pow(x as f64, y as f64))
-                } else {
-                    let e = u32::try_from(y).map_err(|_| overflow(line))?;
-                    Value::Int(x.checked_pow(e).ok_or_else(|| overflow(line))?)
-                }
             }
             BinOp::Concat => unreachable!("concat is handled above"),
         },
@@ -577,12 +520,6 @@ pub fn binary(op: BinOp, l: Value, r: Value, line: u32) -> Res<Value> {
                     }
                     Value::Float(x / y)
                 }
-                BinOp::FloorDiv => {
-                    if y == 0.0 {
-                        return Err(zero());
-                    }
-                    Value::Float(libm::floor(x / y))
-                }
                 BinOp::Mod => {
                     if y == 0.0 {
                         return Err(zero());
@@ -594,7 +531,6 @@ pub fn binary(op: BinOp, l: Value, r: Value, line: u32) -> Res<Value> {
                         m
                     })
                 }
-                BinOp::Pow => Value::Float(libm::pow(x, y)),
                 BinOp::Concat => unreachable!("concat is handled above"),
             }
         }
@@ -813,16 +749,12 @@ fn strftime(date: Date, fmt: &str, line: u32) -> Res<String> {
 
 /// str.split of Python: on runs of whitespace with no separator, else on
 /// each separator, at most `max` times when `max` is 0 or more
-fn split(s: &OStr, sep: Option<&str>, max: i64, from_right: bool) -> Vec<Value> {
+fn split(s: &OStr, sep: Option<&str>, max: i64) -> Vec<Value> {
     let text = s.as_str();
     let mut cuts: Vec<(usize, usize)> = Vec::new();
     match sep {
         Some(sep) => {
-            let found: Vec<(usize, &str)> = if from_right {
-                text.rmatch_indices(sep).collect()
-            } else {
-                text.match_indices(sep).collect()
-            };
+            let found: Vec<(usize, &str)> = text.match_indices(sep).collect();
             let mut taken = Vec::new();
             for (at, m) in found {
                 if max >= 0 && taken.len() as i64 >= max {
@@ -830,7 +762,6 @@ fn split(s: &OStr, sep: Option<&str>, max: i64, from_right: bool) -> Vec<Value> 
                 }
                 taken.push((at, at + m.len()));
             }
-            taken.sort_unstable();
             let mut start = 0;
             for (a, b) in taken {
                 cuts.push((start, a));
@@ -859,10 +790,6 @@ fn split(s: &OStr, sep: Option<&str>, max: i64, from_right: bool) -> Vec<Value> 
             };
             if max < 0 || (words.len() as i64) <= max + 1 {
                 cuts = words;
-            } else if from_right {
-                let keep = words.len() - max as usize;
-                cuts.push((words[0].0, words[keep - 1].1));
-                cuts.extend_from_slice(&words[keep..]);
             } else {
                 let keep = max as usize;
                 cuts.extend_from_slice(&words[..keep]);
@@ -902,23 +829,6 @@ fn upper(s: &OStr) -> OStr {
 
 fn lower(s: &OStr) -> OStr {
     s.map_chars(|c, out| out.extend(c.to_lowercase()))
-}
-
-/// str.title of Python: each run of letters starts upper, the rest lower
-fn title(s: &OStr) -> OStr {
-    let mut prev_cased = false;
-    let mut out = OStr::default();
-    for (at, c) in s.as_str().char_indices() {
-        let mut t = String::new();
-        if prev_cased {
-            t.extend(c.to_lowercase());
-        } else {
-            t.extend(c.to_uppercase());
-        }
-        prev_cased = c.is_alphabetic();
-        out.push(&t, s.origin_at(at));
-    }
-    out
 }
 
 /// str.replace of Python
@@ -989,8 +899,6 @@ pub fn call_method(
                     .map(|(k, v)| Value::Tuple(Rc::new(vec![k.clone(), v.clone()])))
                     .collect(),
             ),
-            "keys" => Value::list(m.iter().map(|(k, _)| k.clone()).collect()),
-            "values" => Value::list(m.iter().map(|(_, v)| v.clone()).collect()),
             _ => {
                 let key = arg(args, kwargs, 0, "key")
                     .ok_or_else(|| type_err(line, "get expected at least 1 argument".into()))?;
@@ -1010,18 +918,13 @@ pub fn call_method(
     };
     plain(obj, "a method", line)?;
     Ok(match name {
-        "split" | "rsplit" => {
+        "split" => {
             let sep = opt_str(arg(args, kwargs, 0, "sep"), line, "the separator")?;
             if sep.as_ref().is_some_and(|s| s.is_empty()) {
                 return Err(err(ErrorKind::Value("empty separator".into()), line));
             }
             let max = opt_int(arg(args, kwargs, 1, "maxsplit"), -1, line)?;
-            Value::list(split(
-                s,
-                sep.as_ref().map(|s| s.as_str()),
-                max,
-                name == "rsplit",
-            ))
+            Value::list(split(s, sep.as_ref().map(|s| s.as_str()), max))
         }
         "strip" | "lstrip" | "rstrip" => {
             let chars = opt_str(arg(args, kwargs, 0, "chars"), line, "the chars")?;
@@ -1066,26 +969,11 @@ pub fn call_method(
         }
         "upper" => Value::ostr(upper(s)),
         "lower" => Value::ostr(lower(s)),
-        "title" => Value::ostr(title(s)),
-        "find" => {
-            let sub = as_str(
-                arg(args, kwargs, 0, "sub").unwrap_or(&Value::None),
-                line,
-                "sub",
-            )?;
-            Value::Int(
-                s.as_str()
-                    .find(sub.as_str())
-                    .map_or(-1, |at| s.as_str()[..at].chars().count() as i64),
-            )
-        }
         _ => {
-            let sub = as_str(
-                arg(args, kwargs, 0, "sub").unwrap_or(&Value::None),
+            return Err(err(
+                ErrorKind::Unsupported("a method outside the subset"),
                 line,
-                "sub",
-            )?;
-            Value::Int(s.as_str().matches(sub.as_str()).count() as i64)
+            ));
         }
     })
 }
@@ -1213,21 +1101,6 @@ pub fn filter(
             }
         },
         "list" => Value::list(iterate(&v, line)?),
-        "first" => iterate(&v, line)?
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| undefined("first", line)),
-        "last" => {
-            if matches!(v, Value::Generator(_)) {
-                return Err(type_err(
-                    line,
-                    "'generator' object is not reversible".into(),
-                ));
-            }
-            iterate(&v, line)?
-                .pop()
-                .unwrap_or_else(|| undefined("last", line))
-        }
         "join" => {
             let sep = arg(args, kwargs, 0, "d").map(soft_str).unwrap_or_default();
             let attribute = opt_str(arg(args, kwargs, 1, "attribute"), line, "the attribute")?;
@@ -1445,78 +1318,15 @@ pub fn test(name: &str, v: &Value, args: &[Value], line: u32) -> Res<bool> {
             v,
             Value::Undefined(_) | Value::Str(_) | Value::List(_) | Value::Tuple(_) | Value::Map(_)
         ),
-        "number" => matches!(v, Value::Int(_) | Value::Float(_) | Value::Bool(_)),
-        "integer" => matches!(v, Value::Int(_)),
-        "float" => matches!(v, Value::Float(_)),
         "boolean" => matches!(v, Value::Bool(_)),
         "true" => matches!(v, Value::Bool(true)),
         "false" => matches!(v, Value::Bool(false)),
-        "callable" => matches!(v, Value::Macro(_) | Value::Function(_) | Value::Method(_)),
-        "equalto" | "eq" | "==" => py_eq(&not_top(v.clone(), line)?, other()?),
-        "ne" | "!=" => !py_eq(&not_top(v.clone(), line)?, other()?),
-        "lt" | "lessthan" | "<" => order(&defined(v.clone(), line)?, other()?, line, "<")?.is_lt(),
-        "le" | "<=" => order(&defined(v.clone(), line)?, other()?, line, "<=")?.is_le(),
-        "gt" | "greaterthan" | ">" => {
-            order(&defined(v.clone(), line)?, other()?, line, ">")?.is_gt()
-        }
-        "ge" | ">=" => order(&defined(v.clone(), line)?, other()?, line, ">=")?.is_ge(),
-        "in" => contains(other()?, &not_top(v.clone(), line)?, line)?,
-        "sameas" => {
-            let o = other()?;
-            match (v, o) {
-                (Value::None, Value::None) => true,
-                (Value::Bool(a), Value::Bool(b)) => a == b,
-                (Value::Str(a), Value::Str(b)) => Rc::ptr_eq(a, b),
-                (Value::List(a), Value::List(b)) => Rc::ptr_eq(a, b),
-                (Value::Map(a), Value::Map(b)) => Rc::ptr_eq(a, b),
-                _ => false,
-            }
-        }
-        "odd" | "even" | "divisibleby" => {
-            let n = match defined(v.clone(), line)? {
-                Value::Int(i) => i,
-                Value::Bool(b) => i64::from(b),
-                o => {
-                    return Err(type_err(
-                        line,
-                        format!("the test {name} of {}", o.type_name()),
-                    ));
-                }
-            };
-            match name {
-                "odd" => n.rem_euclid(2) == 1,
-                "even" => n.rem_euclid(2) == 0,
-                _ => match other()? {
-                    Value::Int(0) => {
-                        return Err(err(ErrorKind::Runtime("division by zero".into()), line));
-                    }
-                    Value::Int(d) => n.rem_euclid(*d) == 0,
-                    o => return Err(type_err(line, format!("divisibleby of {}", o.type_name()))),
-                },
-            }
-        }
-        "lower" | "upper" => {
-            let Value::Str(s) = defined(v.clone(), line)? else {
-                return Ok(false);
-            };
-            let mut cased = false;
-            let mut all = true;
-            for c in s.as_str().chars() {
-                if c.is_lowercase() || c.is_uppercase() {
-                    cased = true;
-                    all &= if name == "lower" {
-                        c.is_lowercase()
-                    } else {
-                        c.is_uppercase()
-                    };
-                }
-            }
-            cased && all
-        }
-        "filter" => matches!(v, Value::Str(s) if REFERENCE_FILTERS.contains(&s.as_str())),
-        "test" => matches!(v, Value::Str(s) if REFERENCE_TESTS.contains(&s.as_str())),
+        "equalto" => py_eq(&not_top(v.clone(), line)?, other()?),
         _ if REFERENCE_TESTS.contains(&name) => {
-            return Err(err(ErrorKind::Unsupported("the test escaped"), line));
+            return Err(err(
+                ErrorKind::Unsupported("a test outside the subset"),
+                line,
+            ));
         }
         _ => return Err(err(ErrorKind::TestUnknown(name.into()), line)),
     })

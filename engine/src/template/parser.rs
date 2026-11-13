@@ -25,8 +25,6 @@ pub enum Node {
         /// the condition of `for x in y if cond`
         filter: Option<Expr>,
         body: Vec<Node>,
-        /// the body of {% else %}: no item
-        otherwise: Vec<Node>,
     },
     /// set name = expr, or set a, b = expr
     Set {
@@ -88,9 +86,7 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
-    FloorDiv,
     Mod,
-    Pow,
     Concat,
 }
 
@@ -371,19 +367,15 @@ impl Parser {
                 }
                 self.expect_end(&Tok::BlockEnd)?;
                 let (body, end) = self.body_to(&["else", "endfor"])?;
-                let otherwise = if end == "else" {
-                    self.expect_end(&Tok::BlockEnd)?;
-                    self.body_to(&["endfor"])?.0
-                } else {
-                    Vec::new()
-                };
+                if end == "else" {
+                    return Err(self.err(ErrorKind::Unsupported("the else of a for loop")));
+                }
                 self.expect_end(&Tok::BlockEnd)?;
                 Ok(Node::For {
                     target,
                     iter,
                     filter,
                     body,
-                    otherwise,
                 })
             }
             "set" => {
@@ -644,18 +636,17 @@ impl Parser {
 
     fn math2(&mut self) -> Res<Expr> {
         self.binary(
-            &[
-                ("*", BinOp::Mul),
-                ("/", BinOp::Div),
-                ("//", BinOp::FloorDiv),
-                ("%", BinOp::Mod),
-            ],
+            &[("*", BinOp::Mul), ("/", BinOp::Div), ("%", BinOp::Mod)],
             Self::pow,
         )
     }
 
     fn pow(&mut self) -> Res<Expr> {
-        self.binary(&[("**", BinOp::Pow)], Self::unary_filtered)
+        let e = self.unary_filtered()?;
+        if self.is_op("//") || self.is_op("**") {
+            return Err(self.err(ErrorKind::Unsupported("the operators // and **")));
+        }
+        Ok(e)
     }
 
     fn unary_filtered(&mut self) -> Res<Expr> {

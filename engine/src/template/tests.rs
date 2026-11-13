@@ -160,6 +160,41 @@ fn each_failure_of_the_subset_has_its_name() {
             "{source}"
         );
     }
+    // the constructs that the subset removed because no template of the
+    // corpus uses them fail by name
+    for (source, what) in [
+        (
+            "{% for x in words %}{% else %}e{% endfor %}",
+            "the else of a for loop",
+        ),
+        ("{{ 7 // 2 }}", "the operators // and **"),
+        ("{{ 2 ** 3 }}", "the operators // and **"),
+        ("{{ words | first }}", "first"),
+        ("{{ words | last }}", "last"),
+        ("{{ 'a'.title() }}", "a method outside the subset"),
+        ("{{ 'a'.rsplit() }}", "a method outside the subset"),
+        ("{{ 'a'.find('a') }}", "a method outside the subset"),
+        ("{{ 'a'.count('a') }}", "a method outside the subset"),
+        ("{{ d.keys() }}", "a method outside the subset"),
+        ("{{ d.values() }}", "a method outside the subset"),
+        ("{{ 1 is number }}", "a test outside the subset"),
+        ("{{ 1 is odd }}", "a test outside the subset"),
+        ("{{ 1 is sameas 1 }}", "a test outside the subset"),
+        (
+            "{{ words | select('odd') | list }}",
+            "a test outside the subset",
+        ),
+        (
+            "{% for x in words %}{{ loop.revindex }}{% endfor %}",
+            "a loop attribute outside the subset",
+        ),
+    ] {
+        assert_eq!(
+            fails(source, Some(DATE)),
+            ErrorKind::Unsupported(what),
+            "{source}"
+        );
+    }
     // the date
     assert_eq!(
         fails("{{ strftime_now('%Y') }}", None),

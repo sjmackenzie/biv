@@ -74,15 +74,9 @@ fn assigned(nodes: &[Node], out: &mut Vec<String>) {
                 out.push(name.clone());
                 assigned(body, out);
             }
-            Node::For {
-                target,
-                body,
-                otherwise,
-                ..
-            } => {
+            Node::For { target, body, .. } => {
                 add(target, out);
                 assigned(body, out);
-                assigned(otherwise, out);
             }
             Node::If {
                 branches,
@@ -185,18 +179,13 @@ impl Checker<'_> {
                 self.nodes(otherwise, &s)
             }
             Node::For {
-                iter,
-                filter,
-                body,
-                otherwise,
-                ..
+                iter, filter, body, ..
             } => {
                 self.expr(iter, Use::Test, safe)?;
                 if let Some(f) = filter {
                     self.expr(f, Use::Test, safe)?;
                 }
-                self.nodes(body, safe)?;
-                self.nodes(otherwise, safe)
+                self.nodes(body, safe)
             }
             Node::Set { value, .. } | Node::SetAttr { value, .. } => {
                 self.expr(value, Use::Value, safe)
@@ -315,7 +304,7 @@ impl Checker<'_> {
                     self.report.unknown_tests.push((name.clone(), line));
                 } else if !TESTS.contains(&name.as_str()) {
                     return Err(unsupported_err(
-                        ErrorKind::Unsupported("the test escaped"),
+                        ErrorKind::Unsupported("a test outside the subset"),
                         line,
                     ));
                 }
@@ -511,18 +500,13 @@ fn names_read(nodes: &[Node], out: &mut Vec<String>) {
                 names_read(otherwise, out);
             }
             Node::For {
-                iter,
-                filter,
-                body,
-                otherwise,
-                ..
+                iter, filter, body, ..
             } => {
                 expr(iter, out);
                 if let Some(f) = filter {
                     expr(f, out);
                 }
                 names_read(body, out);
-                names_read(otherwise, out);
             }
             Node::SetBlock { body, .. } => names_read(body, out),
             Node::Macro(def) => {

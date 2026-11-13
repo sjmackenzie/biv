@@ -225,8 +225,7 @@ impl<'a> Renderer<'a> {
                 iter,
                 filter,
                 body,
-                otherwise,
-            } => return self.for_loop(target, iter, filter.as_ref(), body, otherwise, out),
+            } => return self.for_loop(target, iter, filter.as_ref(), body, out),
             Node::Set { target, value } => {
                 let v = not_top(self.eval(value)?, value.line)?;
                 self.assign_target(target, v, value.line)?;
@@ -283,7 +282,6 @@ impl<'a> Renderer<'a> {
         iter: &Expr,
         filter: Option<&Expr>,
         body: &[Node],
-        otherwise: &[Node],
         out: &mut OStr,
     ) -> Res<Flow> {
         // a loop over an unset value runs no iteration
@@ -306,9 +304,6 @@ impl<'a> Renderer<'a> {
                 kept
             }
         };
-        if items.is_empty() {
-            return self.nodes(otherwise, out);
-        }
         let length = items.len();
         for (i, item) in items.iter().enumerate() {
             self.frames.push(Vec::new());
@@ -368,7 +363,7 @@ impl<'a> Renderer<'a> {
             ExprKind::Name(n) => self.lookup(n, line),
             ExprKind::Attr(obj, attr) => {
                 let o = defined(self.eval(obj)?, line)?;
-                filters::getattr(&o, attr, line)
+                filters::getattr(&o, attr, line)?
             }
             ExprKind::Item(obj, index) => {
                 let o = defined(self.eval(obj)?, line)?;
@@ -677,9 +672,7 @@ pub fn binop_name(op: BinOp) -> &'static str {
         BinOp::Sub => "-",
         BinOp::Mul => "*",
         BinOp::Div => "/",
-        BinOp::FloorDiv => "//",
         BinOp::Mod => "%",
-        BinOp::Pow => "**",
         BinOp::Concat => "~",
     }
 }
