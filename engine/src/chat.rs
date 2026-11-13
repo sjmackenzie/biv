@@ -34,7 +34,7 @@ use crate::sampler::Sampler;
 use crate::tokenizer::{PromptPart, StreamDecoder, TokenId, Tokenizer};
 pub use crate::transcript::Transcript;
 
-use PromptPart::{Content, Template};
+use PromptPart::{Boundary, Content, Template};
 
 /// The chat template's text before the tool definitions in the system block
 const TOOLS_HEADER: &str = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
@@ -142,6 +142,18 @@ pub enum Message<'a> {
     User(&'a str),
     /// the answer, without its reasoning
     Assistant(&'a str),
+    /// an answer with its reasoning, as the model wrote them: `reasoning` is
+    /// the text of the tokens after `<think>\n` and before `</think>`, and
+    /// `answer` the text of the tokens after `</think>`, without the end of
+    /// the message. Neither is trimmed, so a chat that goes on from them
+    /// holds the tokens of the chat that wrote them, when the tokenizer gives
+    /// their text the same tokens. An answer that stopped in its reasoning
+    /// has an empty `answer`. A special token in either text is plain text,
+    /// as in all the content of a message.
+    AssistantWithReasoning {
+        reasoning: &'a str,
+        answer: &'a str,
+    },
 }
 
 /// A function call the model made
@@ -662,7 +674,10 @@ impl<'m> Chat<'m> {
     /// Append `history`, messages of an earlier conversation that this chat
     /// did not generate, then send `user` as [`Chat::send`] does. The chat
     /// template writes an earlier answer with an empty reasoning block, as it
-    /// does for an answer given without its reasoning. This is how a client
+    /// does for an answer given without its reasoning, and an answer with its
+    /// reasoning ([`Message::AssistantWithReasoning`]) as the model wrote it,
+    /// so a chat that holds the answer and a chat that gets it as history
+    /// hold the same text. This is how a client
     /// that keeps the conversation itself, and sends all of it with each
     /// message, continues it on a new chat.
     pub fn send_with_history(
@@ -711,6 +726,16 @@ impl<'m> Chat<'m> {
                 Message::Assistant(text) => message.extend([
                     Template("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
                     Content(text.trim()),
+                    Template("<|im_end|>\n"),
+                ]),
+                Message::AssistantWithReasoning { reasoning, answer } => message.extend([
+                    // the reasoning starts after the generation prompt, so
+                    // its text is tokenized apart from the prompt text
+                    Template("<|im_start|>assistant\n<think>\n"),
+                    Boundary,
+                    Content(reasoning),
+                    Template("</think>"),
+                    Content(answer),
                     Template("<|im_end|>\n"),
                 ]),
             }

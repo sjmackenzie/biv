@@ -21,6 +21,10 @@ pub enum PromptPart<'a> {
     Template(&'a str),
     /// message content, where they are plain text
     Content(&'a str),
+    /// the end of a run of text: the text before it and the text after it
+    /// are tokenized apart, as a prompt and the tokens that the model writes
+    /// after it are
+    Boundary,
 }
 
 pub struct Tokenizer {
@@ -420,13 +424,18 @@ impl Tokenizer {
 
     /// Tokenize a rendered prompt. Special token strings are recognized in the
     /// template's text only, and the text between special tokens is tokenized
-    /// whole, across parts, as it would be in one string.
+    /// whole, across parts, as it would be in one string, unless a
+    /// [`PromptPart::Boundary`] ends it.
     pub fn encode_prompt(&self, parts: &[PromptPart<'_>]) -> Vec<TokenId> {
         let mut out = Vec::new();
         let mut text = String::new();
         for part in parts {
             match *part {
                 PromptPart::Content(s) => text.push_str(s),
+                PromptPart::Boundary => {
+                    self.encode_into(&text, &mut out);
+                    text.clear();
+                }
                 PromptPart::Template(mut rest) => {
                     while let Some((pos, len, id)) = self.find_special(rest) {
                         text.push_str(&rest[..pos]);

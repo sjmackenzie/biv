@@ -142,6 +142,8 @@ fn main() {
         .flat_map(|p| match *p {
             Template(s) => tok.encode_with_special(s),
             Content(s) => tok.encode(s),
+            // a boundary only splits the text, and has no tokens of its own
+            PromptPart::Boundary => Vec::new(),
         })
         .collect();
     println!(
