@@ -48,9 +48,9 @@ const MV_MAX_ROWS: usize = 3;
 /// weights once for 8 input rows (on an M2 Max, a pass of 4 to 8 tokens costs
 /// 1.75-1.9x a decode step, 12 to 16 3.2-3.4x); more use the `mm`
 /// kernels, whose tiles are 32 rows (~4.7x from 5 to 32 tokens)
-const MMV_MAX_ROWS: usize = 16;
+pub const MMV_MAX_ROWS: usize = 16;
 /// Input rows and weight rows (2 simdgroups of 8) per `mmv` threadgroup
-const MMV_ROWS: usize = 8;
+pub const MMV_ROWS: usize = 8;
 const MMV_WEIGHT_ROWS: usize = 16;
 /// The pairs of an expert are multiplied by `mm_id` in tiles of 32, the last
 /// one too when it has this many pairs or more; the others by `mmv_id` in
