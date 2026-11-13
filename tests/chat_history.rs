@@ -5,7 +5,7 @@
 
 mod common;
 
-use biv::chat::{Chat, ChatOptions, Message, ReasoningEffort};
+use biv::chat::{Chat, ChatOptions, Message, ReasoningEffort, Step};
 use biv::tokenizer::{PromptPart, Tokenizer};
 use common::{NO_DRAFT, Script, model_path, sampler};
 
@@ -35,14 +35,10 @@ fn template(tok: &Tokenizer) -> Vec<biv::tokenizer::TokenId> {
     ])
 }
 
-#[test]
-#[ignore = "needs a model file"]
-fn a_chat_takes_the_messages_of_an_earlier_conversation_as_the_template_writes_them() {
-    let gguf = biv_cli::open_gguf(model_path()).expect("gguf");
-    let tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
-    let word = tok.encode(WORD);
-    let engine = Script::new(word, tok.n_vocab());
-    let opts = ChatOptions {
+/// Thinking on and no system block (reasoning effort medium gives no
+/// reasoning instructions), so the prompt is `template`
+fn options() -> ChatOptions {
+    ChatOptions {
         system: None,
         thinking: true,
         effort: ReasoningEffort::Medium,
@@ -52,8 +48,17 @@ fn a_chat_takes_the_messages_of_an_earlier_conversation_as_the_template_writes_t
         lookup: 0,
         tools: Vec::new(),
         ..ChatOptions::default()
-    };
-    let mut chat = Chat::new(&engine, &tok, opts).expect("chat");
+    }
+}
+
+#[test]
+#[ignore = "needs a model file"]
+fn a_chat_takes_the_messages_of_an_earlier_conversation_as_the_template_writes_them() {
+    let gguf = biv_cli::open_gguf(model_path()).expect("gguf");
+    let tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
+    let word = tok.encode(WORD);
+    let engine = Script::new(word, tok.n_vocab());
+    let mut chat = Chat::new(&engine, &tok, options()).expect("chat");
     let history = [Message::User(FIRST), Message::Assistant(ANSWER)];
     let stats = chat
         .send_with_history(&history, SECOND, &mut sampler(), |_| {}, || false)
@@ -61,4 +66,25 @@ fn a_chat_takes_the_messages_of_an_earlier_conversation_as_the_template_writes_t
     let expected = template(&tok);
     assert_eq!(stats.prompt_tokens, expected.len());
     assert_eq!(*engine.fed.borrow(), expected);
+}
+
+#[test]
+#[ignore = "needs a model file"]
+fn an_open_turn_gives_its_prompt_tokens_before_the_prompt_pass() {
+    let gguf = biv_cli::open_gguf(model_path()).expect("gguf");
+    let tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
+    let word = tok.encode(WORD);
+    let engine = Script::new(word, tok.n_vocab());
+    let mut chat = Chat::new(&engine, &tok, options()).expect("chat");
+    assert_eq!(chat.turn_prompt_tokens(), None);
+    let history = [Message::User(FIRST), Message::Assistant(ANSWER)];
+    chat.begin_with_history(&history, SECOND).expect("turn");
+    assert_eq!(chat.turn_prompt_tokens(), Some(template(&tok).len()));
+    assert!(engine.fed.borrow().is_empty(), "no prompt pass yet");
+    let mut sampler = sampler();
+    while !matches!(
+        chat.step(&mut sampler, |_| {}).expect("step"),
+        Step::Done(..)
+    ) {}
+    assert_eq!(chat.turn_prompt_tokens(), None);
 }

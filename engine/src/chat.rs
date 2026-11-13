@@ -438,6 +438,15 @@ impl<'m> Chat<'m> {
         &self.pending
     }
 
+    /// The prompt tokens of the open turn, the pending tokens included: the
+    /// tokens that its prompt passes process, as [`TurnStats::prompt_tokens`]
+    /// gives them. `None` when no turn is open. With [`Chat::n_past`] and
+    /// the answer room of a turn, a caller can tell before the prompt pass
+    /// whether the answer fits in the context.
+    pub fn turn_prompt_tokens(&self) -> Option<usize> {
+        self.turn.as_ref().map(|turn| turn.stats.prompt_tokens)
+    }
+
     /// Save the conversation so far, to [`Chat::restore`] it in this chat or
     /// another on the same engine. Before the first message, the system prompt
     /// is processed now, so that the prefix holds it.
