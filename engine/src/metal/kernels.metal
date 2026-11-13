@@ -969,7 +969,9 @@ kernel void rms_norm(
         ss = lane < (ntg + 31)/32 ? partial[lane] : 0.f;
         ss = simd_sum(ss);
     }
-    const float scale = rsqrt(ss/a.n + a.eps);
+    // the order of ops::rms_norm, with correctly rounded divisions and sqrt
+    const float mean = precise::divide(ss, float(a.n));
+    const float scale = precise::divide(1.0f, precise::sqrt(mean + a.eps));
 
     device float * o = out + row*a.ostride;
     for (int i = tid; i < a.n; i += ntg) {
@@ -1036,7 +1038,9 @@ kernel void attn_prep(
         ss += vals[j]*vals[j];
     }
     ss = simd_sum(ss);
-    const float scale = rsqrt(ss/hd + a.eps);
+    // the order of ops::rms_norm, with correctly rounded divisions and sqrt
+    const float mean = precise::divide(ss, float(hd));
+    const float scale = precise::divide(1.0f, precise::sqrt(mean + a.eps));
     for (int j = 0; j < E; j++) {
         vals[j] *= scale * w[lane + 32*j];
     }
@@ -1574,10 +1578,10 @@ kernel void gdn(
         k4 *= rsqrt(simd_sum(dot(k4, k4)) + a.eps);
 
         const float x  = alpha[t*a.hv + head] + dt;
-        const float sp = x > 20.f ? x : log(1.f + exp(x));
+        const float sp = x > 20.f ? x : precise::log(1.f + precise::exp(x));
         const float b  = sigmoid(beta[t*a.hv + head]);
 
-        ls *= exp(sp * an);
+        ls *= precise::exp(sp * an);
         const float s_k = simd_sum(dot(ls, k4));
         const float d = (vj - s_k) * b;
         ls += k4 * d;
