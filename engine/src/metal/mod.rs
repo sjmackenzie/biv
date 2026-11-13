@@ -30,6 +30,14 @@ use crate::tokenizer::TokenId;
 
 const SOURCE: &str = include_str!("kernels.metal");
 
+/// The Metal source with the constants that it shares with the CPU path
+fn source() -> String {
+    format!(
+        "#define SIGMOID_OVERFLOW_X {:?}f\n{SOURCE}",
+        crate::ops::SIGMOID_OVERFLOW_X
+    )
+}
+
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;
@@ -707,7 +715,7 @@ impl<'m> MetalEngine<'m> {
 
         let device = MTLCreateSystemDefaultDevice().ok_or_else(|| backend("metal: no device"))?;
         let library = device
-            .newLibraryWithSource_options_error(&NSString::from_str(SOURCE), None)
+            .newLibraryWithSource_options_error(&NSString::from_str(&source()), None)
             .map_err(|e| {
                 backend(format!(
                     "metal: shader compilation failed: {}",

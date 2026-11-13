@@ -34,8 +34,33 @@ struct MatArgs {
     ulong x_row_bytes;
 };
 
-inline float silu(float x) { return x / (1.0f + exp(-x)); }
-inline float sigmoid(float x) { return 1.0f / (1.0f + exp(-x)); }
+// Fast math lets the compiler assume that no value is INF, so a score that
+// must not count is a finite value far below any real score. The start of a
+// running max is SCORE_FLOOR, and a masked score is MASKED_SCORE, below it.
+// Every exp of a score minus a running max then has a finite argument of at
+// most about FLT_MAX/4 in magnitude, and a masked or empty term gives
+// exp(-FLT_MAX/8) or less, which is 0, as exp(-INFINITY) is.
+constant float SCORE_FLOOR  = -FLT_MAX/8;
+constant float MASKED_SCORE = -FLT_MAX/4;
+
+// SIGMOID_OVERFLOW_X is ops::SIGMOID_OVERFLOW_X, which the engine defines
+// before this source when it compiles the library.
+#ifndef SIGMOID_OVERFLOW_X
+#error "the engine defines SIGMOID_OVERFLOW_X"
+#endif
+
+// At or above SIGMOID_OVERFLOW_X, the forms of ggml; below it exp(-x) can
+// overflow, so the form that computes exp(x)
+inline float sigmoid(float x) {
+    if (x < SIGMOID_OVERFLOW_X) {
+        const float e = exp(x);
+        return e / (1.0f + e);
+    }
+    return 1.0f / (1.0f + exp(-x));
+}
+inline float silu(float x) {
+    return x < SIGMOID_OVERFLOW_X ? x * sigmoid(x) : x / (1.0f + exp(-x));
+}
 inline float bf16_to_f32(ushort h) { return as_type<float>(uint(h) << 16); }
 
 // ---------------------------------------------------------------------------
@@ -1122,7 +1147,7 @@ kernel void attn_split(
                 acc[h][4*j + i] = 0.f;
             }
         }
-        m[h] = -INFINITY;
+        m[h] = SCORE_FLOOR;
         l[h] = 0.f;
     }
 
@@ -1170,11 +1195,12 @@ kernel void attn_split(
 
     float f[HPS];
     for (int h = 0; h < HPS; h++) {
-        float M = -INFINITY;
+        float M = SCORE_FLOOR;
         for (int r = 0; r < PS; r++) {
             M = max(M, sm[r*G + hg*HPS + h]);
         }
-        f[h] = m[h] == -INFINITY ? 0.f : exp(m[h] - M);
+        // an empty stride has kept its start value
+        f[h] = m[h] == SCORE_FLOOR ? 0.f : exp(m[h] - M);
     }
     for (int r = 0; r < PS; r++) {
         if (ps == r) {
@@ -1195,13 +1221,14 @@ kernel void attn_split(
     }
     if (tid < G) {
         const int g = tid;
-        float M = -INFINITY;
+        float M = SCORE_FLOOR;
         for (int r = 0; r < PS; r++) {
             M = max(M, sm[r*G + g]);
         }
         float L = 0.f;
         for (int r = 0; r < PS; r++) {
-            L += sm[r*G + g] == -INFINITY ? 0.f : sl[r*G + g]*exp(sm[r*G + g] - M);
+            // an empty stride has kept its start value
+            L += sm[r*G + g] == SCORE_FLOOR ? 0.f : sl[r*G + g]*exp(sm[r*G + g] - M);
         }
         part_ml[2*(part + g*a.splits)]     = M;
         part_ml[2*(part + g*a.splits) + 1] = L;
@@ -1232,8 +1259,8 @@ kernel void attn_reduce(
     const int hd   = a.hd;
     const int part = (t*a.n_head + head)*a.splits;
 
-    // split 0 always holds position 0, so M is finite
-    float M = -INFINITY;
+    // split 0 always holds position 0, so M is a real score
+    float M = SCORE_FLOOR;
     for (int s = 0; s < a.splits; s++) {
         M = max(M, part_ml[2*(part + s)]);
     }
@@ -1319,7 +1346,7 @@ kernel void attn_flash(
     float L[NQ];
     FOR_UNROLL (int j = 0; j < NQ; j++) {
         last[j] = a.pos0 + min(row0 + sg*NQ + j, rows - 1)/G;
-        M[j] = -FLT_MAX/2;
+        M[j] = SCORE_FLOOR;
         L[j] = 0.f;
     }
     const int last_end = a.pos0 + (min(row0 + R, rows) - 1)/G + 1;
@@ -1377,7 +1404,7 @@ kernel void attn_flash(
             float m = M[j];
             FOR_UNROLL (int c = 0; c < CL; c++) {
                 const int i = lane + 32*c;
-                s[c] = p0 + i <= last[j] && p0 + i < end ? ss[r*C + i] : -INFINITY;
+                s[c] = p0 + i <= last[j] && p0 + i < end ? ss[r*C + i] : MASKED_SCORE;
                 m = max(m, s[c]);
             }
             m = simd_max(m);
@@ -1639,7 +1666,7 @@ kernel void moe_route(
     const short nsg = (ntg + 31)/32;
     device const float * l = logits + tg*ne;
 
-    float m = -INFINITY;
+    float m = SCORE_FLOOR;
     for (int i = tid; i < ne; i += ntg) {
         m = max(m, l[i]);
     }
