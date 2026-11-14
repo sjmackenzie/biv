@@ -235,7 +235,8 @@ fn chat_from_a_replayed_session() {
             empty,
             overfull,
             Vec::new(),
-            Vec::new()
+            Vec::new(),
+            biv::chat::Conversation::new(None, Vec::new()),
         ),
         Err(Error::ContextFull { .. })
     ));
@@ -262,6 +263,7 @@ fn chat_from_a_replayed_session() {
         Vec::new(),
         Vec::new(),
         history,
+        first.conversation().clone(),
     )
     .expect("chat from session");
     assert_eq!(second.n_past(), first.n_past());
@@ -328,6 +330,7 @@ fn chat_from_a_session_replayed_after_an_answer() {
         pending,
         generated,
         history,
+        first.conversation().clone(),
     )
     .expect("chat from session");
     assert_eq!(second.n_past(), n_past);

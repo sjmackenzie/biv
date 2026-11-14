@@ -96,6 +96,7 @@ fn close_at_the_end_of_the_context(
         pending.clone(),
         chat.generated().to_vec(),
         chat.history().to_vec(),
+        chat.conversation().clone(),
     )
     .expect("a chat goes on from the turn");
     pending
