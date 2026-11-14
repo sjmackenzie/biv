@@ -174,7 +174,10 @@ impl fmt::Display for Error {
                 f.write_str("the chat template gives no special token that ends the reasoning")
             }
             Error::EffortUnsupported(word) => {
-                write!(f, "the chat template does not take the reasoning effort {word}")
+                write!(
+                    f,
+                    "the chat template does not take the reasoning effort {word}"
+                )
             }
             Error::Backend(msg) => f.write_str(msg),
         }

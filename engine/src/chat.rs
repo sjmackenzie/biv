@@ -36,7 +36,7 @@ use crate::engine::{DraftLogits, Engine, Session, Snapshot};
 use crate::memory::SessionMemory;
 use crate::prelude::*;
 use crate::sampler::Sampler;
-use crate::template::{ChatFormat, EFFORT_WORDS, Origin, Template, ToolCallForm, Value};
+use crate::template::{self, ChatFormat, EFFORT_WORDS, Origin, Template, ToolCallForm, Value};
 use crate::tokenizer::{PromptPart, StreamDecoder, TokenId, Tokenizer};
 pub use crate::transcript::Transcript;
 
@@ -389,21 +389,20 @@ fn load_format(tok: &Tokenizer) -> Result<Format, Error> {
         .ok_or_else(|| Error::MissingToken(probe.turn_end.clone()))?;
 
     // the reasoning end token: the generation prompt with thinking off
-    // minus the one with thinking on, trimmed to one special token
+    // minus the one with thinking on, trimmed, must be one special token
     let reasoning_end = if probe.reasoning.is_some() {
         let diff = probe
             .generation_prompt_plain
             .strip_prefix(&probe.generation_prompt_thinking)
-            .unwrap_or("");
+            .ok_or(Error::Probe(template::ProbeError::TemplateReasoningUnclear))?;
         let trimmed = diff.trim();
-        if !trimmed.is_empty() && is_special(trimmed) {
-            Some(
-                tok.token_id(trimmed)
-                    .ok_or_else(|| Error::MissingToken(trimmed.into()))?,
-            )
-        } else {
-            None
+        if trimmed.is_empty() || !is_special(trimmed) {
+            return Err(Error::Probe(template::ProbeError::TemplateReasoningUnclear));
         }
+        Some(
+            tok.token_id(trimmed)
+                .ok_or_else(|| Error::MissingToken(trimmed.into()))?,
+        )
     } else {
         None
     };
@@ -720,11 +719,7 @@ impl<'m> Chat<'m> {
     }
 
     /// Start a turn as [`Chat::send_with_history`] does, to [`Chat::step`]
-    pub fn begin_with_history(
-        &mut self,
-        history: &[Message<'_>],
-        user: &str,
-    ) -> Result<(), Error> {
+    pub fn begin_with_history(&mut self, history: &[Message<'_>], user: &str) -> Result<(), Error> {
         self.no_turn()?;
         let messages_before = self.conversation.messages.len();
         for m in history {
@@ -749,10 +744,7 @@ impl<'m> Chat<'m> {
     }
 
     /// Start a turn as [`Chat::send_tool_responses`] does, to [`Chat::step`]
-    pub fn begin_tool_responses(
-        &mut self,
-        responses: &[impl AsRef<str>],
-    ) -> Result<(), Error> {
+    pub fn begin_tool_responses(&mut self, responses: &[impl AsRef<str>]) -> Result<(), Error> {
         self.no_turn()?;
         let messages_before = self.conversation.messages.len();
         for r in responses {
@@ -896,7 +888,14 @@ impl<'m> Chat<'m> {
                 (answer, logits)
             }
         };
-        self.choose_tokens(stats, answer, logits, sampler, &mut on_event, messages_before)
+        self.choose_tokens(
+            stats,
+            answer,
+            logits,
+            sampler,
+            &mut on_event,
+            messages_before,
+        )
     }
 
     pub fn cancel(&mut self, mut on_event: impl FnMut(Event<'_>)) -> Result<TurnStats, Error> {

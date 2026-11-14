@@ -5,8 +5,9 @@
 
 mod common;
 
-use biv::chat::{Chat, ChatOptions, Message, ReasoningEffort, Said, Step};
+use biv::Error;
 use biv::chat::Conversation as ChatConversation;
+use biv::chat::{Chat, ChatOptions, Message, ReasoningEffort, Said, Step};
 use biv::template::{Origin, Template, Value, json};
 use biv::tokenizer::{PromptPart, TokenId, Tokenizer};
 use common::{NO_DRAFT, Script, model_path, sampler};
@@ -80,7 +81,10 @@ fn conversations() -> Vec<Conversation> {
         plain(
             "two turns, thinking",
             true,
-            vec![Message::User("Name a prime number."), Message::Assistant("Seven.")],
+            vec![
+                Message::User("Name a prime number."),
+                Message::Assistant("Seven."),
+            ],
             "And the next one?",
         ),
         plain(
@@ -136,7 +140,10 @@ fn conversations() -> Vec<Conversation> {
             "a tool call whose argument bytes tojson would change",
             false,
             None,
-            vec![("get_weather", vec![("city", "Paris"), ("options", RAW_OPTIONS)])],
+            vec![(
+                "get_weather",
+                vec![("city", "Paris"), ("options", RAW_OPTIONS)],
+            )],
             vec![r#"{"temperature": 18}"#],
         ),
         tool_case(
@@ -253,7 +260,12 @@ fn message(role: &str, content: &str, reasoning: Option<&str>) -> Value {
     message_with(role, content, reasoning, Vec::new())
 }
 
-fn message_with(role: &str, content: &str, reasoning: Option<&str>, extra: Vec<(Value, Value)>) -> Value {
+fn message_with(
+    role: &str,
+    content: &str,
+    reasoning: Option<&str>,
+    extra: Vec<(Value, Value)>,
+) -> Value {
     let mut m = vec![(text("role"), text(role)), (text("content"), text(content))];
     if let Some(r) = reasoning {
         m.push((text("reasoning_content"), text(r)));
@@ -300,12 +312,7 @@ fn render_conversation_messages(conv: &ChatConversation, messages: &mut Vec<Valu
                         .collect();
                     extra.push((text("tool_calls"), Value::list(calls)));
                 }
-                message_with(
-                    "assistant",
-                    answer,
-                    reasoning.as_deref(),
-                    extra,
-                )
+                message_with("assistant", answer, reasoning.as_deref(), extra)
             }
         });
     }
@@ -365,7 +372,9 @@ fn new_tokens(tok: &Tokenizer, t: &Template, c: &Conversation) -> Vec<TokenId> {
         messages.push(match *m {
             Message::User(u) => message("user", u, None),
             Message::Assistant(a) => message("assistant", a, None),
-            Message::AssistantWithReasoning { reasoning, answer } => message("assistant", answer, Some(reasoning)),
+            Message::AssistantWithReasoning { reasoning, answer } => {
+                message("assistant", answer, Some(reasoning))
+            }
         });
     }
     messages.push(message("user", c.user, None));
@@ -379,12 +388,20 @@ fn new_tokens(tok: &Tokenizer, t: &Template, c: &Conversation) -> Vec<TokenId> {
                     (text("type"), text("function")),
                     (
                         text("function"),
-                        Value::map(vec![(text("name"), text(name)), (text("arguments"), Value::map(arguments))]),
+                        Value::map(vec![
+                            (text("name"), text(name)),
+                            (text("arguments"), Value::map(arguments)),
+                        ]),
                     ),
                 ])
             })
             .collect();
-        messages.push(message_with("assistant", "", t.reasoning, vec![(text("tool_calls"), Value::list(calls))]));
+        messages.push(message_with(
+            "assistant",
+            "",
+            t.reasoning,
+            vec![(text("tool_calls"), Value::list(calls))],
+        ));
         for r in &t.responses {
             messages.push(message("tool", r, None));
         }
@@ -392,7 +409,12 @@ fn new_tokens(tok: &Tokenizer, t: &Template, c: &Conversation) -> Vec<TokenId> {
     let tools = if c.tools.is_empty() {
         Value::None
     } else {
-        Value::list(c.tools.iter().map(|t| json::parse(t, Origin::Content).expect("a tool")).collect())
+        Value::list(
+            c.tools
+                .iter()
+                .map(|t| json::parse(t, Origin::Content).expect("a tool"))
+                .collect(),
+        )
     };
     let mut vars = vec![
         ("messages".to_string(), Value::list(messages)),
@@ -405,7 +427,10 @@ fn new_tokens(tok: &Tokenizer, t: &Template, c: &Conversation) -> Vec<TokenId> {
         ("preserve_thinking".to_string(), Value::Bool(true)),
     ];
     if c.thinking {
-        vars.push(("reasoning_effort".to_string(), Value::str(effort_word(c.effort), Origin::Template)));
+        vars.push((
+            "reasoning_effort".to_string(),
+            Value::str(effort_word(c.effort), Origin::Template),
+        ));
     }
     let segments = t.render(&vars, None).expect("it renders");
     let parts: Vec<PromptPart<'_>> = segments
@@ -426,13 +451,25 @@ fn the_template_of_the_model_file_gives_the_tokens_of_the_fixed_template() {
     let template = Template::load(TEMPLATE, &VARIABLES).expect("it loads");
     let mut differ = Vec::new();
     for c in conversations() {
-        let (old, new) = (old_tokens(&tok, &template, &c), new_tokens(&tok, &template, &c));
+        let (old, new) = (
+            old_tokens(&tok, &template, &c),
+            new_tokens(&tok, &template, &c),
+        );
         if old == new {
             println!("same: {}", c.name);
             continue;
         }
-        let at = old.iter().zip(&new).position(|(a, b)| a != b).unwrap_or(old.len().min(new.len()));
-        let show = |t: &[TokenId]| format!("{:?}", tok.decode(&t[at.saturating_sub(4)..(at + 6).min(t.len())]));
+        let at = old
+            .iter()
+            .zip(&new)
+            .position(|(a, b)| a != b)
+            .unwrap_or(old.len().min(new.len()));
+        let show = |t: &[TokenId]| {
+            format!(
+                "{:?}",
+                tok.decode(&t[at.saturating_sub(4)..(at + 6).min(t.len())])
+            )
+        };
         differ.push(format!(
             "{}: {} old tokens, {} new tokens, first difference at {at}: old {} new {}",
             c.name,
@@ -446,4 +483,45 @@ fn the_template_of_the_model_file_gives_the_tokens_of_the_fixed_template() {
         println!("DIFFER {d}");
     }
     assert!(differ.is_empty(), "{} conversations differ", differ.len());
+}
+
+/// A template whose generation prompts with thinking on and off do not
+/// share a prefix fails the probe: the reasoning end token cannot be
+/// found from them.
+#[test]
+#[ignore = "needs a model file"]
+fn misaligned_generation_prompts_fail_the_probe() {
+    // a template that renders reasoning in a past message (so the probe
+    // finds it), but whose generation prompts with thinking on and off
+    // start with different texts
+    let source = r#"{%- for message in messages -%}
+<|im_start|>{{ message.role }}
+{%- if message.reasoning_content is defined and message.reasoning_content %}
+<think>
+{{ message.reasoning_content }}</think>
+{% endif %}
+{{ message.content }}<|im_end|>
+{% endfor -%}
+{%- if add_generation_prompt -%}
+{%- if enable_thinking -%}
+<|im_start|>assistant
+<think>
+{%- else -%}
+<|im_start|>assistant
+NO_THINK_PROMPT
+{%- endif -%}
+{%- endif -%}"#;
+    let gguf = biv_cli::open_gguf(model_path()).expect("gguf");
+    let mut tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
+    tok.chat_template = Some(source.to_string());
+    let engine = Script::new(vec![], tok.n_vocab());
+    let opts = ChatOptions {
+        thinking: true,
+        ..ChatOptions::default()
+    };
+    match Chat::new(&engine, &tok, opts) {
+        Err(Error::Probe(..)) => {}
+        Err(e) => panic!("expected a probe error, got: {e}"),
+        Ok(_) => panic!("must fail"),
+    }
 }
